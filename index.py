@@ -1751,6 +1751,122 @@ def _resolve_topic(topic):
     return topic
 
 
+def _topic_letter_from_full(full):
+    if not full:
+        return "any"
+    for letter, t in TOPIC_MAP.items():
+        if t.lower() in full.lower() or letter == full.strip():
+            return letter
+    return "any"
+
+
+def _bank_save_generated(task_type, topic_letter, task_data, audio_b64=None):
+    try:
+        n = _bank_next_number(task_type, topic_letter)
+        code = f"{task_type}-{topic_letter}-{n:03d}"
+        meta = {
+            "code": code, "task_type": task_type, "topic": topic_letter,
+            "topic_full": TOPIC_MAP.get(topic_letter, ""),
+            "instruction": task_data.get("instruction", ""),
+            "has_audio": bool(audio_b64),
+        }
+        for k in ("statements", "scripts", "answer_key", "extra_statement",
+                  "questions", "interview_script", "script", "headings", "texts",
+                  "extra_heading", "fragments", "extra_fragment", "title", "text",
+                  "items", "explanations", "dialogue_script", "task_text",
+                  "survey_data", "plan"):
+            if k in task_data:
+                meta[k] = task_data[k]
+        s3 = _s3()
+        prefix = _bank_prefix(task_type, topic_letter)
+        s3.put_object(Bucket=BUCKET_NAME, Key=f"{prefix}{code}.json",
+                      Body=json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+                      ContentType="application/json")
+        if audio_b64:
+            mp3 = base64.b64decode(audio_b64)
+            s3.put_object(Bucket=BUCKET_NAME, Key=f"{prefix}{code}.mp3",
+                          Body=mp3, ContentType="audio/mpeg")
+        print(f"[bank-save] {code}")
+        return code
+    except Exception as e:
+        print(f"[bank-save] {type(e).__name__}: {e}")
+        return None
+
+
+def _bank_fetch_random(task_type, topic_letter=None):
+    try:
+        s3 = _s3()
+        files = []
+        if topic_letter and topic_letter != "any":
+            files = [f for f in _bank_list_raw(task_type, topic_letter) if f.endswith(".json")]
+        else:
+            paginator = s3.get_paginator("list_objects_v2")
+            prefix = f"tasks/{task_type}/"
+            for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    if obj["Key"].endswith(".json"):
+                        files.append(obj["Key"])
+        if not files:
+            return None
+        key = random.choice(files)
+        obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+        meta = json.loads(obj["Body"].read().decode("utf-8"))
+        mp3_key = key.replace(".json", ".mp3")
+        try:
+            mp3_obj = s3.get_object(Bucket=BUCKET_NAME, Key=mp3_key)
+            meta["audio_b64"] = base64.b64encode(mp3_obj["Body"].read()).decode("utf-8")
+        except Exception:
+            pass
+        return meta
+    except Exception as e:
+        print(f"[bank-fetch] {type(e).__name__}: {e}")
+        return None
+
+
+def generate_variant_prefer_bank(topic_config):
+    RAW_PIPELINES = {
+        "1": generate_task_1, "2": generate_task_2, "3-9": generate_task_3_9,
+        "10": generate_task_10, "11": generate_task_11, "12-18": generate_task_12_18,
+        "19-24": generate_task_19_24, "25-29": generate_task_25_29,
+        "30-36": generate_task_30_36, "37": generate_task_37,
+        "38.1": generate_task_38_1, "38.2": generate_task_38_2,
+    }
+    result, chosen_topics, sources, fresh_tests = {}, {}, {}, {}
+    for tt in VARIANT_TASKS:
+        raw = topic_config.get(tt) or "any"
+        topic_full = _resolve_topic(raw)
+        chosen_topics[tt] = topic_full
+        topic_letter = "any" if raw in ("any", "random") else _topic_letter_from_full(raw)
+        bank_item = _bank_fetch_random(tt, topic_letter if topic_letter != "any" else None)
+        if bank_item:
+            print(f"[variant] {tt}: bank ({bank_item.get('code')})")
+            result[tt] = bank_item
+            sources[tt] = "bank"
+            continue
+        print(f"[variant] {tt}: LLM")
+        gen = RAW_PIPELINES[tt](topic_full)
+        if isinstance(gen, dict) and "error" in gen:
+            return {"error": f"Task {tt}: {gen['error']}"}
+        result[tt] = gen
+        sources[tt] = "llm"
+        if tt not in ("37", "38.1", "38.2"):
+            fresh_tests[tt] = gen
+    if fresh_tests:
+        try:
+            _batch_explanations_for_variant(fresh_tests)
+            for tt in fresh_tests:
+                if fresh_tests[tt].get("explanations"):
+                    result[tt]["explanations"] = fresh_tests[tt]["explanations"]
+        except Exception as e:
+            print(f"[variant-explanations] {e}")
+    for tt in VARIANT_TASKS:
+        if sources.get(tt) == "llm":
+            raw = topic_config.get(tt) or "any"
+            letter = "any" if raw in ("any", "random") else _topic_letter_from_full(raw)
+            _bank_save_generated(tt, letter, result[tt])
+    return {"ok": True, "tasks": result, "chosen_topics": chosen_topics, "sources": sources}
+
+
 def generate_variant(topic_config):
     RAW_PIPELINES = {
         "1": generate_task_1, "2": generate_task_2, "3-9": generate_task_3_9,
@@ -2939,6 +3055,355 @@ def _read_body(event):
         except Exception:
             pass
     return body
+
+TASK_INSTRUCTIONS = {
+    "1": "\u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 6 \u0432\u044b\u0441\u043a\u0430\u0437\u044b\u0432\u0430\u043d\u0438\u0439. \u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0438\u0435 \u043c\u0435\u0436\u0434\u0443 \u0432\u044b\u0441\u043a\u0430\u0437\u044b\u0432\u0430\u043d\u0438\u044f\u043c\u0438 \u043a\u0430\u0436\u0434\u043e\u0433\u043e \u0433\u043e\u0432\u043e\u0440\u044f\u0449\u0435\u0433\u043e \u0410\u2013F \u0438 \u0443\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f\u043c\u0438, \u0434\u0430\u043d\u043d\u044b\u043c\u0438 \u0432 \u0441\u043f\u0438\u0441\u043a\u0435 1\u20137. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u043a\u0430\u0436\u0434\u043e\u0435 \u0443\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u043e\u0435 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0449\u0435\u0439 \u0446\u0438\u0444\u0440\u043e\u0439, \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u0434\u0438\u043d \u0440\u0430\u0437. \u0412 \u0437\u0430\u0434\u0430\u043d\u0438\u0438 \u0435\u0441\u0442\u044c \u043e\u0434\u043d\u043e \u043b\u0438\u0448\u043d\u0435\u0435 \u0443\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435. \u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 \u0437\u0430\u043f\u0438\u0441\u044c \u0434\u0432\u0430\u0436\u0434\u044b. \u0417\u0430\u043d\u0435\u0441\u0438\u0442\u0435 \u0441\u0432\u043e\u0438 \u043e\u0442\u0432\u0435\u0442\u044b \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0443.",
+    "2": "\u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 \u0434\u0438\u0430\u043b\u043e\u0433. \u041e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u0435, \u043a\u0430\u043a\u0438\u0435 \u0438\u0437 \u043f\u0440\u0438\u0432\u0435\u0434\u0451\u043d\u043d\u044b\u0445 \u0443\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0439 \u0410\u2013G \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0442 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u043d\u0438\u044e \u0442\u0435\u043a\u0441\u0442\u0430 (1 \u2013 True), \u043a\u0430\u043a\u0438\u0435 \u043d\u0435 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0442 (2 \u2013 False) \u0438 \u043e \u0447\u0451\u043c \u0432 \u0442\u0435\u043a\u0441\u0442\u0435 \u043d\u0435 \u0441\u043a\u0430\u0437\u0430\u043d\u043e, \u0442\u043e \u0435\u0441\u0442\u044c \u043d\u0430 \u043e\u0441\u043d\u043e\u0432\u0430\u043d\u0438\u0438 \u0442\u0435\u043a\u0441\u0442\u0430 \u043d\u0435\u043b\u044c\u0437\u044f \u0434\u0430\u0442\u044c \u043d\u0438 \u043f\u043e\u043b\u043e\u0436\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0433\u043e, \u043d\u0438 \u043e\u0442\u0440\u0438\u0446\u0430\u0442\u0435\u043b\u044c\u043d\u043e\u0433\u043e \u043e\u0442\u0432\u0435\u0442\u0430 (3 \u2013 Not stated). \u0417\u0430\u043d\u0435\u0441\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440 \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u0433\u043e \u0412\u0430\u043c\u0438 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0430 \u043e\u0442\u0432\u0435\u0442\u0430 \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0443. \u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 \u0437\u0430\u043f\u0438\u0441\u044c \u0434\u0432\u0430\u0436\u0434\u044b.",
+    "3-9": "\u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 \u0438\u043d\u0442\u0435\u0440\u0432\u044c\u044e. \u0412 \u0437\u0430\u0434\u0430\u043d\u0438\u044f\u0445 3\u20139 \u0437\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 \u043f\u043e\u043b\u0435 \u043e\u0442\u0432\u0435\u0442\u0430 \u0446\u0438\u0444\u0440\u0443 1, 2 \u0438\u043b\u0438 3, \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0449\u0443\u044e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u0412\u0430\u043c\u0438 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0443 \u043e\u0442\u0432\u0435\u0442\u0430. \u0412\u044b \u0443\u0441\u043b\u044b\u0448\u0438\u0442\u0435 \u0437\u0430\u043f\u0438\u0441\u044c \u0434\u0432\u0430\u0436\u0434\u044b.",
+    "10": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0438\u0435 \u043c\u0435\u0436\u0434\u0443 \u0442\u0435\u043a\u0441\u0442\u0430\u043c\u0438 A\u2013G \u0438 \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043a\u0430\u043c\u0438 1\u20138. \u0417\u0430\u043d\u0435\u0441\u0438\u0442\u0435 \u0441\u0432\u043e\u0438 \u043e\u0442\u0432\u0435\u0442\u044b \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0443. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u043a\u0430\u0436\u0434\u0443\u044e \u0446\u0438\u0444\u0440\u0443 \u0442\u043e\u043b\u044c\u043a\u043e \u043e\u0434\u0438\u043d \u0440\u0430\u0437. \u0412 \u0437\u0430\u0434\u0430\u043d\u0438\u0438 \u043e\u0434\u0438\u043d \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043e\u043a \u043b\u0438\u0448\u043d\u0438\u0439.",
+    "11": "\u041f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u0442\u0435\u043a\u0441\u0442 \u0438 \u0437\u0430\u043f\u043e\u043b\u043d\u0438\u0442\u0435 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0438 A\u2013F \u0447\u0430\u0441\u0442\u044f\u043c\u0438 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0439, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u044b\u043c\u0438 \u0446\u0438\u0444\u0440\u0430\u043c\u0438 1\u20137. \u041e\u0434\u043d\u0430 \u0438\u0437 \u0447\u0430\u0441\u0442\u0435\u0439 \u0432 \u0441\u043f\u0438\u0441\u043a\u0435 1\u20137 \u043b\u0438\u0448\u043d\u044f\u044f. \u0417\u0430\u043d\u0435\u0441\u0438\u0442\u0435 \u0446\u0438\u0444\u0440\u044b, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0430\u044e\u0449\u0438\u0435 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0435 \u0447\u0430\u0441\u0442\u0438 \u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0439, \u0432 \u0442\u0430\u0431\u043b\u0438\u0446\u0443.",
+    "12-18": "\u041f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u0442\u0435\u043a\u0441\u0442 \u0438 \u0432\u044b\u043f\u043e\u043b\u043d\u0438\u0442\u0435 \u0437\u0430\u0434\u0430\u043d\u0438\u044f 12\u201318. \u0412 \u043a\u0430\u0436\u0434\u043e\u043c \u0437\u0430\u0434\u0430\u043d\u0438\u0438 \u0437\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 \u043f\u043e\u043b\u0435 \u043e\u0442\u0432\u0435\u0442\u0430 \u0446\u0438\u0444\u0440\u0443 1, 2, 3 \u0438\u043b\u0438 4, \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044e\u0449\u0443\u044e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u0412\u0430\u043c\u0438 \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0443 \u043e\u0442\u0432\u0435\u0442\u0430.",
+    "19-24": "\u041f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u043f\u0440\u0438\u0432\u0435\u0434\u0451\u043d\u043d\u044b\u0439 \u043d\u0438\u0436\u0435 \u0442\u0435\u043a\u0441\u0442 / \u043f\u0440\u0438\u0432\u0435\u0434\u0451\u043d\u043d\u044b\u0435 \u043d\u0438\u0436\u0435 \u0442\u0435\u043a\u0441\u0442\u044b. \u041f\u0440\u0435\u043e\u0431\u0440\u0430\u0437\u0443\u0439\u0442\u0435, \u0435\u0441\u043b\u0438 \u043d\u0435\u043e\u0431\u0445\u043e\u0434\u0438\u043c\u043e, \u0441\u043b\u043e\u0432\u0430, \u043d\u0430\u043f\u0435\u0447\u0430\u0442\u0430\u043d\u043d\u044b\u0435 \u0437\u0430\u0433\u043b\u0430\u0432\u043d\u044b\u043c\u0438 \u0431\u0443\u043a\u0432\u0430\u043c\u0438 \u0432 \u043a\u043e\u043d\u0446\u0435 \u0441\u0442\u0440\u043e\u043a, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u044b\u0445 \u043d\u043e\u043c\u0435\u0440\u0430\u043c\u0438 19\u201324, \u0442\u0430\u043a, \u0447\u0442\u043e\u0431\u044b \u043e\u043d\u0438 \u0433\u0440\u0430\u043c\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u043e\u0432\u0430\u043b\u0438 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u043d\u0438\u044e \u0442\u0435\u043a\u0441\u0442\u043e\u0432.",
+    "25-29": "\u041f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u043f\u0440\u0438\u0432\u0435\u0434\u0451\u043d\u043d\u044b\u0439 \u043d\u0438\u0436\u0435 \u0442\u0435\u043a\u0441\u0442. \u041e\u0431\u0440\u0430\u0437\u0443\u0439\u0442\u0435 \u043e\u0442 \u0441\u043b\u043e\u0432, \u043d\u0430\u043f\u0435\u0447\u0430\u0442\u0430\u043d\u043d\u044b\u0445 \u0437\u0430\u0433\u043b\u0430\u0432\u043d\u044b\u043c\u0438 \u0431\u0443\u043a\u0432\u0430\u043c\u0438 \u0432 \u043a\u043e\u043d\u0446\u0435 \u0441\u0442\u0440\u043e\u043a, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u044b\u0445 \u043d\u043e\u043c\u0435\u0440\u0430\u043c\u0438 25\u201329, \u043e\u0434\u043d\u043e\u043a\u043e\u0440\u0435\u043d\u043d\u044b\u0435 \u0441\u043b\u043e\u0432\u0430.",
+    "30-36": "\u041f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u0442\u0435\u043a\u0441\u0442 \u0441 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430\u043c\u0438, \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u044b\u043c\u0438 \u043d\u043e\u043c\u0435\u0440\u0430\u043c\u0438 30\u201336. \u0417\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 \u043f\u043e\u043b\u0435 \u043e\u0442\u0432\u0435\u0442\u0430 \u0446\u0438\u0444\u0440\u0443 1, 2, 3 \u0438\u043b\u0438 4.",
+}
+
+
+IMPORT_PROMPT = """You parse Russian EGE English exam tasks. Return ONLY valid JSON. Do not invent content.
+
+Task type: {task_type}
+
+Expected JSON structure:
+{structure}
+
+Pasted task data (may include Russian instruction, task body, table, chart data):
+{task_text}
+
+Audio script with speaker genders (Name (M): text or Name (F): text):
+{audio_text}
+
+Answer key:
+{key_text}
+
+Rules:
+1. Extract ALL content from the pasted task into the JSON structure. Do NOT fill the "instruction" field (it is added automatically).
+2. English content stays English, Russian content stays Russian.
+3. Task 1 scripts: [{"speaker": "A".."F", "text": "..."}]. No gender needed.
+4. Task 2 dialogue_script and Task 3-9 interview_script: each entry {"speaker": "Name", "gender": "M" or "F", "text": "..."}.
+   Gender from (M)/(F)/(m)/(f) mark after speaker name. If missing - guess by common name (Ben, Mike, Sophie, Anna etc.).
+5. Task 38.1/38.2 survey_data.options from the pasted table/chart.
+   Each option = {"option": "text", "percent": number_without_percent_sign}.
+   task_text stays as the full instruction line + question + plan.
+   plan = array of plan step strings from "Use the following plan:" section.
+6. Task 37: task_text = full email task (From/To/Subject + body + Write an email...).
+7. Tasks 19-29: items[].source_word = base word in CAPS.
+   text must contain __19__ style markers where the gap is.
+8. answer_key: numbers for 1-18 and 30-36; strings for 19-29. Skip if missing.
+9. Never invent. If a field is impossible to extract, omit it.
+
+Return ONLY JSON. No text outside."""
+
+
+def _import_structure(task_type):
+    table = {
+        "1": '{"statements": [{"number": 1, "text": "..."}], "scripts": [{"speaker": "A", "text": "..."}], "answer_key": {"A": 3}, "extra_statement": 7}',
+        "2": '{"statements": [{"letter": "A", "text": "..."}], "dialogue_script": [{"speaker": "Ben", "gender": "M", "text": "..."}], "answer_key": {"A": 1}}',
+        "3-9": '{"questions": [{"number": 3, "question": "...", "options": {"1": "...", "2": "...", "3": "..."}}], "interview_script": [{"speaker": "Mike", "gender": "M", "text": "..."}], "answer_key": {"3": 1}}',
+        "10": '{"headings": [{"number": 1, "text": "..."}], "texts": [{"letter": "A", "text": "..."}], "answer_key": {"A": 3}, "extra_heading": 8}',
+        "11": '{"title": "...", "text": "Text with __1__ markers", "fragments": [{"number": 1, "text": "..."}], "answer_key": {"A": 3}, "extra_fragment": 7}',
+        "12-18": '{"title": "...", "text": "Full reading text", "questions": [{"number": 12, "question": "...", "options": {"1": "...", "2": "...", "3": "...", "4": "..."}}], "answer_key": {"12": 1}}',
+        "19-24": '{"title": "...", "text": "Full text with __19__ markers", "items": [{"number": 19, "source_word": "SITUATE"}], "answer_key": {"19": "situated"}}',
+        "25-29": '{"title": "...", "text": "Full text", "items": [{"number": 25, "source_word": "CERTAIN"}], "answer_key": {"25": "certainly"}}',
+        "30-36": '{"title": "...", "text": "Text with (30) ____ markers", "items": [{"number": 30, "options": {"1": "...", "2": "...", "3": "...", "4": "..."}}], "answer_key": {"30": 3}}',
+        "37": '{"task_text": "Full email task text with From/To/Subject and instructions"}',
+        "38.1": '{"task_text": "Full task text", "survey_data": {"question": "...", "options": [{"option": "...", "percent": 48}]}, "plan": ["make an opening statement...", "select and report 2-3 facts...", "make 1-2 comparisons...", "outline a problem...", "conclude..."]}',
+        "38.2": '{"task_text": "Full task text", "survey_data": {"question": "...", "options": [{"option": "...", "percent": 30}]}, "plan": ["make an opening statement...", "select and report 2-3 facts...", "make 1-2 comparisons...", "outline a problem...", "conclude..."]}',
+    }
+    return table.get(task_type, "{}")
+
+
+def admin_import_task(task_type, topic_letter, task_text, audio_text, key_text):
+    structure = _import_structure(task_type)
+    prompt = IMPORT_PROMPT
+    prompt = prompt.replace("{task_type}", str(task_type))
+    prompt = prompt.replace("{structure}", structure)
+    prompt = prompt.replace("{task_text}", task_text or "(empty)")
+    prompt = prompt.replace("{audio_text}", audio_text or "(empty)")
+    prompt = prompt.replace("{key_text}", key_text or "(empty)")
+    r = call_llm(prompt, retries=1)
+    if "error" in r:
+        return {"error": "LLM: " + str(r["error"])}
+    if not isinstance(r, dict):
+        return {"error": "LLM returned non-object"}
+    if "task_data" in r and isinstance(r["task_data"], dict):
+        task_data = r["task_data"]
+    else:
+        task_data = r
+    if not task_data:
+        return {"error": "Empty task_data from LLM"}
+    task_data["instruction"] = TASK_INSTRUCTIONS.get(str(task_type), "")
+    return {"ok": True, "task_data": task_data}
+
+
+def admin_import_save(task_type, topic_letter, task_data):
+    if not isinstance(task_data, dict) or not task_data:
+        return {"error": "task_data is empty"}
+    if "_bank_save_generated" not in globals():
+        return {"error": "patch variant_builder required"}
+    code = _bank_save_generated(task_type, topic_letter, task_data)
+    if not code:
+        return {"error": "Failed to save to bank"}
+    return {"ok": True, "code": code}
+
+
+
+
+
+def _pdf_escape(s):
+    from xml.sax.saxutils import escape as _e
+    return _e(str(s or ""))
+
+def _pdf_font():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os as _os
+    cands = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/TTF/DejaVuSans.ttf',
+    ]
+    for p in cands:
+        try:
+            if _os.path.exists(p):
+                pdfmetrics.registerFont(TTFont('MainFont', p))
+                return 'MainFont'
+        except Exception:
+            pass
+    return 'Helvetica'
+
+
+
+def _answer_lines(n, height=22):
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    width = 180 * mm
+    rows = [[''] for _ in range(n)]
+    t = Table(rows, colWidths=[width], rowHeights=[height]*n)
+    style = [('VALIGN', (0,0), (-1,-1), 'BOTTOM')]
+    for i in range(n):
+        style.append(('LINEBELOW', (0,i), (-1,i), 0.5, colors.HexColor('#888888')))
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _render_task_pdf(task_type, task_data, with_answers=False):
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
+    font = _pdf_font()
+    st_title = ParagraphStyle('t', fontName=font, fontSize=15, leading=18, alignment=1, spaceAfter=8)
+    st_inst = ParagraphStyle('i', fontName=font, fontSize=10, leading=13, textColor=colors.HexColor('#222222'), spaceAfter=6)
+    st_text = ParagraphStyle('tx', fontName=font, fontSize=11, leading=14, spaceAfter=4)
+    st_h = ParagraphStyle('h', fontName=font, fontSize=12, leading=15, spaceAfter=4)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+    story = []
+    story.append(Paragraph(_pdf_escape('Задание ' + str(task_type)), st_title))
+
+    ins = task_data.get('instruction', '')
+    if ins:
+        story.append(Paragraph(_pdf_escape(ins), st_inst))
+
+    tbl_style = TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), font),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#e8e8e8')),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ])
+
+    if task_type == '1':
+        for s in task_data.get('statements', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(s.get('number')) + '.') + '</b> ' + _pdf_escape(s.get('text')), st_text))
+        story.append(Spacer(1, 8))
+        row1 = ['Говорящий'] + list('ABCDEF')
+        row2 = ['Ответ'] + [''] * 6
+        t = Table([row1, row2], colWidths=[80, 45, 45, 45, 45, 45, 45])
+        t.setStyle(tbl_style)
+        story.append(t)
+    elif task_type == '2':
+        for s in task_data.get('statements', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(s.get('letter')) + '.') + '</b> ' + _pdf_escape(s.get('text')), st_text))
+        story.append(Spacer(1, 8))
+        row1 = ['Утв.'] + list('ABCDEFG')
+        row2 = ['Ответ'] + [''] * 7
+        t = Table([row1, row2], colWidths=[60, 40, 40, 40, 40, 40, 40, 40])
+        t.setStyle(tbl_style)
+        story.append(t)
+        story.append(Paragraph('1 – True, 2 – False, 3 – Not stated', st_text))
+    elif task_type == '3-9':
+        for q in task_data.get('questions', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(q.get('number')) + '.') + '</b> ' + _pdf_escape(q.get('question')), st_text))
+            opts = q.get('options') or {}
+            for k in ['1','2','3']:
+                story.append(Paragraph(_pdf_escape(k + ') ' + str(opts.get(k, ''))), st_text))
+    elif task_type == '10':
+        for h in task_data.get('headings', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(h.get('number')) + '.') + '</b> ' + _pdf_escape(h.get('text')), st_text))
+        story.append(Spacer(1, 8))
+        for x in task_data.get('texts', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(x.get('letter')) + '.</b> ' + _pdf_escape(x.get('text')), st_text))
+        story.append(Spacer(1, 8))
+        row1 = list('ABCDEFG')
+        row2 = [''] * 7
+        t = Table([row1, row2], colWidths=[55]*7)
+        t.setStyle(tbl_style)
+        story.append(t)
+    elif task_type == '11':
+        if task_data.get('title'):
+            story.append(Paragraph(_pdf_escape(task_data.get('title')), st_h))
+        if task_data.get('text'):
+            story.append(Paragraph(_pdf_escape(task_data.get('text')).replace('\n', '<br/>'), st_text))
+        story.append(Spacer(1, 6))
+        for f in task_data.get('fragments', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(f.get('number')) + '.') + '</b> ' + _pdf_escape(f.get('text')), st_text))
+        story.append(Spacer(1, 8))
+        row1 = list('ABCDEF')
+        row2 = [''] * 6
+        t = Table([row1, row2], colWidths=[60]*6)
+        t.setStyle(tbl_style)
+        story.append(t)
+    elif task_type in ('12-18', '30-36'):
+        if task_data.get('title'):
+            story.append(Paragraph(_pdf_escape(task_data.get('title')), st_h))
+        if task_data.get('text'):
+            story.append(Paragraph(_pdf_escape(task_data.get('text')).replace('\n', '<br/>'), st_text))
+        story.append(Spacer(1, 6))
+        items = task_data.get('questions') or task_data.get('items') or []
+        for it in items:
+            num = it.get('number')
+            q = it.get('question')
+            if q:
+                story.append(Paragraph('<b>' + _pdf_escape(str(num) + '.') + '</b> ' + _pdf_escape(q), st_text))
+            else:
+                story.append(Paragraph('<b>' + _pdf_escape(str(num) + '.') + '</b>', st_text))
+            opts = it.get('options') or {}
+            for k in ['1','2','3','4']:
+                story.append(Paragraph(_pdf_escape(k + ') ' + str(opts.get(k, ''))), st_text))
+    elif task_type in ('19-24', '25-29'):
+        if task_data.get('title'):
+            story.append(Paragraph(_pdf_escape(task_data.get('title')), st_h))
+        if task_data.get('text'):
+            story.append(Paragraph(_pdf_escape(task_data.get('text')).replace('\n', '<br/>'), st_text))
+        story.append(Spacer(1, 8))
+        for it in task_data.get('items', []) or []:
+            story.append(Paragraph('<b>' + _pdf_escape(str(it.get('number')) + '.') + '</b> ' + _pdf_escape(it.get('source_word')) + ' — ____________________', st_text))
+    elif task_type == '37':
+        if task_data.get('task_text'):
+            story.append(Paragraph(_pdf_escape(task_data.get('task_text')).replace('\n', '<br/>'), st_text))
+        story.append(Spacer(1, 10))
+        story.append(Paragraph('Ответ (100–140 слов):', st_h))
+        story.append(_answer_lines(20))
+    elif task_type in ('38.1', '38.2'):  # CLEAN_38B
+        _sd = task_data.get('survey_data') or {}
+        _opts = _sd.get('options') or []
+        _question = _sd.get('question') or ''
+        _plan = task_data.get('plan') or []
+        _tt = task_data.get('task_text', '') or ''
+
+        _parts = re.split(r'[\t\n]+', _tt)
+        _keep = []
+        for _ln in _parts:
+            _s = _ln.strip()
+            if not _s:
+                continue
+            _low = _s.lower()
+            if _low.startswith('imagine that'):
+                _keep.append(_s)
+            elif _low.startswith('comment on'):
+                _keep.append(_s)
+
+        if not _keep:
+            _keep.append(_tt.strip())
+
+        _intro = ' '.join(_keep)
+        if _intro:
+            story.append(Paragraph(_pdf_escape(_intro), st_text))
+
+        if not _question:
+            _m = re.search(r'The survey question:\s*(.+?)(?:\s*Choose one option|\t|$)', _tt)
+            if _m:
+                _question = _m.group(1).strip()
+
+        if not _opts:
+            _m2 = re.search(r'Options\s+Number of respondents.*?(?=Write\s+\d)', _tt, re.DOTALL)
+            if _m2:
+                _block = _m2.group(0)
+                for _line in re.split(r'[\t\n]+', _block):
+                    _line = _line.strip()
+                    if not _line or _line.lower().startswith('options') or 'respondent' in _line.lower():
+                        continue
+                    _mm = re.match(r'^(.+?)\s+(\d+)$', _line)
+                    if _mm:
+                        _opts.append({'option': _mm.group(1).strip(), 'percent': _mm.group(2)})
+
+        if _question:
+            story.append(Spacer(1, 8))
+            story.append(Paragraph('<b>' + _pdf_escape(_question) + '</b>', st_text))
+
+        if _opts:
+            _rows = [['Options', 'Number of respondents (%)']]
+            for _o in _opts:
+                _rows.append([str(_o.get('option','')), str(_o.get('percent',''))])
+            _t = Table(_rows, colWidths=[120, 80])
+            _t.setStyle(tbl_style)
+            story.append(_t)
+
+        story.append(Spacer(1, 8))
+        story.append(Paragraph('<b>Write 200-250 words.</b>', st_text))
+        if _plan:
+            story.append(Paragraph('<b>Use the following plan:</b>', st_text))
+            for _p in _plan:
+                story.append(Paragraph(chr(0x2013) + ' ' + _pdf_escape(_p), st_text))
+        story.append(Spacer(1, 10))
+        story.append(Paragraph('\u041e\u0442\u0432\u0435\u0442 (200\u2013250 \u0441\u043b\u043e\u0432):', st_h))
+        try:
+            story.append(_answer_lines(24))
+        except NameError:
+            for _i in range(24):
+                story.append(Paragraph('_' * 100, st_text))
+
+    if with_answers:
+        story.append(PageBreak())
+        story.append(Paragraph('ОТВЕТЫ', st_title))
+        key = task_data.get('answer_key') or {}
+        parts = []
+        for k in key:
+            parts.append(str(k) + '→' + str(key[k]))
+        story.append(Paragraph(_pdf_escape('   '.join(parts)), st_text))
+        exps = task_data.get('explanations') or {}
+        if exps:
+            story.append(Spacer(1, 8))
+            story.append(Paragraph('Объяснения:', st_h))
+            for k in exps:
+                story.append(Paragraph('<b>' + _pdf_escape(str(k)) + ':</b> ' + _pdf_escape(exps[k]), st_text))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+
 def handler(event, context):
     method = event.get("httpMethod", "GET")
     qs = event.get("queryStringParameters") or {}
@@ -3241,9 +3706,47 @@ def handler(event, context):
                                    "max": RATELIMIT_MAX})
 
             # ---------------- ВАРИАНТЫ ----------------
+            if action == "import_preview":
+                _t = data.get("task_type")
+                _txt = data.get("task_text") or ""
+                _aud = data.get("audio_text") or ""
+                _key = data.get("key_text") or ""
+                if not _t:
+                    return _resp(400, {"error": "task_type required"})
+                if not _txt:
+                    return _resp(400, {"error": "task_text is empty"})
+                _r = admin_import_task(_t, "", _txt, _aud, _key)
+                return _resp(200 if "ok" in _r else 500, _r)
+
+            if action == "import_save":
+                _t = data.get("task_type")
+                _top = (data.get("topic_letter") or "").strip().upper()
+                _td = data.get("task_data") or {}
+                if not _t or not _top:
+                    return _resp(400, {"error": "task_type and topic_letter required"})
+                _r = admin_import_save(_t, _top, _td)
+                return _resp(200 if "ok" in _r else 500, _r)
+
+            if action == "pdf_download":
+                _t = data.get("task_type") or ""
+                _td = data.get("task_data") or {}
+                _wa = bool(data.get("with_answers"))
+                if not _t:
+                    return _resp(400, {"error": "task_type required"})
+                if not _td:
+                    return _resp(400, {"error": "task_data required"})
+                try:
+                    import base64 as _b64
+                    pdf_bytes = _render_task_pdf(_t, _td, _wa)
+                    return _resp(200, {"ok": True, "pdf": _b64.b64encode(pdf_bytes).decode("ascii")})
+                except Exception as _e:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    return _resp(500, {"error": str(_e)})
+
             if action == "variant_generate":
                 topic_config = data.get("topic_config") or {}
-                r = generate_variant(topic_config)
+                r = generate_variant_prefer_bank(topic_config)
                 if "error" in r:
                     return _resp(500, r)
                 return _resp(200, r)
@@ -3590,7 +4093,7 @@ details .script-speaker{color:#00e5ff;font-weight:600;margin-right:8px}
 
     <div class="card" id="myVariantsCard" style="display:none">
       <h3>📦 Мои варианты</h3>
-      <div id="myVariants"><div class="mat-empty">Загрузка…</div></div>
+      <div style="margin-bottom:14px"><button class="btn btn-ok" style="width:auto;padding:12px 24px;font-size:16px" onclick="openBuildVariant()">Собрать вариант ЕГЭ</button></div><div id="myVariants"><div class="mat-empty">Загрузка…</div></div>
     </div>
 
     <div class="card" id="myAssignmentsCard" style="display:none">
@@ -3644,6 +4147,50 @@ details .script-speaker{color:#00e5ff;font-weight:600;margin-right:8px}
       <div id="studentStats"><div class="mat-empty">Загрузка…</div></div>
     </div>
   </aside>
+</div>
+
+<div class="modal-bg" id="buildVariantModal" onclick="if(event.target===this)closeBuildVariant()">
+  <div class="modal" style="max-width:600px">
+    <button class="close" onclick="closeBuildVariant()">×</button>
+    <h3>Собрать вариант ЕГЭ</h3>
+    <p style="color:#8b93c4;font-size:14px;line-height:1.6;margin-bottom:14px">
+      Соберём все задания (1–36, 37 и одно 38). Займёт 5–7 минут. Не закрывай страницу.
+    </p>
+    <div class="f">
+      <label>Задание 38 — выбери одно</label>
+      <div style="display:flex;gap:20px;margin-top:6px;flex-wrap:wrap">
+        <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
+          <input type="radio" name="sb38" value="38.1" checked style="accent-color:#7b5cff;transform:scale(1.3)"> 38.1 (таблица)
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
+          <input type="radio" name="sb38" value="38.2" style="accent-color:#7b5cff;transform:scale(1.3)"> 38.2 (диаграмма)
+        </label>
+      </div>
+    </div>
+    <div class="f">
+      <label>Режим темы</label>
+      <div style="display:flex;gap:20px;margin-top:6px;flex-wrap:wrap">
+        <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
+          <input type="radio" name="sbMode" value="same" checked onchange="onSbModeChange()" style="accent-color:#7b5cff;transform:scale(1.3)"> Одна тема на весь вариант
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
+          <input type="radio" name="sbMode" value="random" onchange="onSbModeChange()" style="accent-color:#7b5cff;transform:scale(1.3)"> Случайно для каждого задания
+        </label>
+      </div>
+    </div>
+    <div class="f" id="sbTopicWrap">
+      <label>Тема</label>
+      <select id="sbTopic">__TOPIC_OPTIONS__</select>
+    </div>
+    <button class="btn btn-ok" id="sbStartBtn" onclick="buildStudentVariant()">Собрать вариант</button>
+    <div id="sbProgress" style="display:none;margin-top:14px;padding:14px;background:rgba(123,92,255,.1);border-radius:10px">
+      <div style="color:#c9b8ff;font-size:14px;font-weight:600;margin-bottom:8px" id="sbProgressText">Готовим…</div>
+      <div style="background:rgba(5,6,15,.5);border-radius:6px;height:8px;overflow:hidden">
+        <div id="sbProgressBar" style="height:100%;background:linear-gradient(90deg,#7b5cff,#00e5ff);width:0%;transition:width .3s"></div>
+      </div>
+    </div>
+    <div id="sbError" class="er" style="display:none;margin-top:12px"></div>
+  </div>
 </div>
 
 <div class="modal-bg" id="resultModal" onclick="if(event.target===this)closeResultModal()">
@@ -3775,24 +4322,54 @@ function renderTaskForPrint(t, d, opts){
     if(d.task_text) h+='<div class="tt">'+esc(d.task_text)+'</div>';
     h+='<h3 style="margin-top:14pt">Answer sheet</h3>';
     for(var i=0;i<22;i++) h+='<div style="border-bottom:1pt dotted #888;height:22pt"></div>';
-  } else if(t==='38.1'||t==='38.2'){
-    if(d.task_text) h+='<div class="tt">'+esc(d.task_text)+'</div>';
+  } else if(t==='38.1'||t==='38.2'){  /* FIX38C */
     var sd = d.survey_data || {};
-    if(sd.question) h+='<p style="text-align:center;font-weight:bold">The survey question: &laquo;'+esc(String(sd.question).replace(/^"+|"+$/g,''))+'&raquo;</p>';
-    if(t==='38.1'){
-      h+='<table><tr><th>Options</th><th>Number of respondents (%)</th></tr>';
-      (sd.options||[]).forEach(function(o){h+='<tr><td>'+esc(o.option)+'</td><td style="text-align:center">'+esc(o.percent)+'</td></tr>';});
-      h+='</table>';
-    } else {
-      h+='<table><tr><th>Segment</th><th>%</th></tr>';
-      (sd.options||[]).forEach(function(o){h+='<tr><td>'+esc(o.option)+'</td><td style="text-align:center">'+esc(o.percent)+'</td></tr>';});
-      h+='</table>';
+    var _tt = d.task_text || '';
+    var _intro = '';
+    var _lines = _tt.split(/\n+/);
+    var _kept = [];
+    for (var _i = 0; _i < _lines.length; _i++) {
+      var _s = _lines[_i].trim();
+      if (!_s) continue;
+      var _l = _s.toLowerCase();
+      if (_l.indexOf('imagine that') === 0 || _l.indexOf('comment on') === 0) {
+        _kept.push(_s);
+      }
     }
-    h+='<p style="margin-top:12pt"><b>Write 200–250 words.</b></p>';
-    h+='<p><b>Use the following plan:</b></p>';
-    (d.plan||[]).forEach(function(p){h+='<div style="margin-left:18pt">– '+esc(p)+'</div>';});
-    h+='<h3 style="margin-top:14pt">Answer sheet</h3>';
-    for(var j=0;j<22;j++) h+='<div style="border-bottom:1pt dotted #888;height:22pt"></div>';
+    _intro = _kept.join(' ');
+    if (_intro) h += '<div class="tt">' + esc(_intro) + '</div>';
+    if (sd.question) {
+      var _q = String(sd.question).replace(/^"+|"+$/g, '').replace(/\s*Choose one option\s*$/, '').trim();
+      h += '<p style="text-align:center;font-weight:bold;margin:14px 0">The survey question: &laquo;' + esc(_q) + '&raquo;</p>';
+    }
+    if (t === '38.1') {
+      h += '<table class="tb"><tr><th>Options</th><th>Number of respondents (%)</th></tr>';
+      (sd.options || []).forEach(function(o) {
+        h += '<tr><td>' + esc(o.option) + '</td><td style="text-align:center">' + esc(o.percent) + '</td></tr>';
+      });
+      h += '</table>';
+    } else {
+      var _opts2 = sd.options || [], _grad = [], _st2 = 0;
+      _opts2.forEach(function(o, i) {
+        var _e = _st2 + (Number(o.percent) / 100) * 360;
+        _grad.push(PIE[i % PIE.length] + ' ' + _st2 + 'deg ' + _e + 'deg');
+        _st2 = _e;
+      });
+      if (_grad.length) h += '<div class="pi" style="background:conic-gradient(' + _grad.join(',') + ')"></div>';
+      h += '<div class="lg">';
+      _opts2.forEach(function(o, i) {
+        var _lbl = (o.option && String(o.option).trim()) ? o.option : ('Segment ' + (i + 1));
+        h += '<div class="i"><span class="c" style="background:' + PIE[i % PIE.length] + '"></span>' + esc(_lbl) + ' \u2014 ' + esc(o.percent) + '%</div>';
+      });
+      h += '</div>';
+    }
+    h += '<p style="margin-top:14px"><b>Write 200\u2013250 words.</b></p>';
+    if (d.plan && d.plan.length) {
+      h += '<p><b>Use the following plan:</b></p>';
+      d.plan.forEach(function(p) {
+        h += '<div style="margin-left:18pt">\u2013 ' + esc(p) + '</div>';
+      });
+    }
   }
   return h;
 }
@@ -4006,7 +4583,7 @@ async function loadMyAssignments(){
         + '<div class="as-date">от '+esc(fmtDate(a.created_at))+'</div></div>'
         + '<button class="btn btn-sm btn-ok" onclick="openAssignment(\\''+esc(a.id)+'\\',\\''+esc(a.task_type)+'\\')">▶ Открыть</button></div>';
     }).join('');
-  }catch(e){ card.style.display = 'none'; }
+  }catch(e){ box.innerHTML = 'Ошибка загрузки'; }
 }
 
 async function openAssignment(aid, task_type){
@@ -4028,15 +4605,99 @@ const V_TASK_MAX = {"1":2,"2":3,"3-9":7,"10":3,"11":2,"12-18":7,"19-24":6,"25-29
 let _myVariantsCache = null;
 let _activeVariant = null;
 
+function openBuildVariant() {
+  document.getElementById('buildVariantModal').classList.add('show');
+  document.getElementById('sbProgress').style.display = 'none';
+  document.getElementById('sbError').style.display = 'none';
+  var btn = document.getElementById('sbStartBtn');
+  btn.disabled = false;
+  btn.textContent = 'Собрать вариант';
+  onSbModeChange();
+}
+function closeBuildVariant() {
+  document.getElementById('buildVariantModal').classList.remove('show');
+}
+function onSbModeChange() {
+  var mode = document.querySelector('input[name="sbMode"]:checked');
+  var wrap = document.getElementById('sbTopicWrap');
+  if (mode && wrap) {
+    wrap.style.display = (mode.value === 'same') ? 'block' : 'none';
+  }
+}
+function _sbUpdateProgress(pct, text) {
+  document.getElementById('sbProgress').style.display = 'block';
+  document.getElementById('sbProgressBar').style.width = pct + '%';
+  document.getElementById('sbProgressText').textContent = text;
+}
+async function buildStudentVariant() {
+  var btn = document.getElementById('sbStartBtn');
+  var errEl = document.getElementById('sbError');
+  errEl.style.display = 'none';
+  var choice38 = document.querySelector('input[name="sb38"]:checked').value;
+  var mode = document.querySelector('input[name="sbMode"]:checked').value;
+  var topic = 'any';
+  if (mode === 'same') {
+    topic = document.getElementById('sbTopic').value;
+  }
+  var taskTypes = ["1","2","3-9","10","11","12-18","19-24","25-29","30-36","37", choice38];
+  var total = taskTypes.length, tasks = {}, chosen = {};
+  btn.disabled = true;
+  btn.textContent = 'Идёт генерация…';
+  try {
+    for (var i = 0; i < total; i++) {
+      var tt = taskTypes[i];
+      _sbUpdateProgress(Math.round(i * 90 / total), 'Генерирую задание ' + tt + ' (' + (i+1) + '/' + total + ')…');
+      var payload = {action:'variant_generate', topic_config: {}};
+      if (mode === 'random') {
+        payload.topic_config[tt] = 'random';
+      } else {
+        payload.topic_config[tt] = topic;
+      }
+      var g = await fetch(window.location.pathname, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      }).then(function(r){ return r.json(); });
+      if (g.error) throw new Error('Задание ' + tt + ': ' + g.error);
+      tasks[tt] = g.tasks[tt];
+      if (g.chosen_topics && g.chosen_topics[tt]) chosen[tt] = g.chosen_topics[tt];
+    }
+    _sbUpdateProgress(93, 'Сохраняю вариант…');
+    var cr = await fetch(window.location.pathname, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'variant_create', tasks: tasks, topic_config: chosen})
+    }).then(function(r){ return r.json(); });
+    if (cr.error) throw new Error(cr.error);
+    _sbUpdateProgress(97, 'Назначаю тебе…');
+    var as = await fetch(window.location.pathname, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'variant_assign', id: cr.id, student_codes: [STUDENT_CODE]})
+    }).then(function(r){ return r.json(); });
+    if (as.error) throw new Error(as.error);
+    _sbUpdateProgress(100, 'Готово!');
+    await new Promise(function(r){ setTimeout(r, 600); });
+    closeBuildVariant();
+    loadMyVariants();
+    alert('Вариант собран! Открой его в разделе «Мои варианты».');
+  } catch (e) {
+    errEl.style.display = 'block';
+    errEl.textContent = 'Ошибка: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = 'Собрать вариант';
+  }
+}
 async function loadMyVariants(){
   if (!IS_LOGGED_IN) return;
   var card = document.getElementById('myVariantsCard');
   var box = document.getElementById('myVariants');
+  card.style.display = 'block';
   try{
     var d = await fetch(window.location.pathname,{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({action:'variant_my_list', student_code: STUDENT_CODE})}).then(function(r){return r.json();});
-    if (d.error || !d.variants || !d.variants.length) { card.style.display = 'none'; return; }
-    card.style.display = 'block';
+    if (d.error || !d.variants || !d.variants.length) {
+      box.innerHTML = 'У вас пока нет вариантов. Нажмите «Собрать вариант ЕГЭ» выше.';
+      _myVariantsCache = [];
+      return;
+    }
     _myVariantsCache = d.variants;
     box.innerHTML = d.variants.map(function(v, i){
       var sub = v.submission;
@@ -4712,6 +5373,314 @@ if (IS_LOGGED_IN) {
   loadMyAssignments();
   loadMyVariants();
 }
+// VIEW_FIX_PATCH
+(function(){
+  // 1. hide Upload tab
+  try {
+    var btn = document.querySelector('[data-tab="upload"]');
+    if (btn) btn.style.display = 'none';
+    var pane = document.getElementById('pane-upload');
+    if (pane) pane.style.display = 'none';
+    var bankBtn = document.querySelector('[data-tab="bank"]');
+    var bankPane = document.getElementById('pane-bank');
+    if (bankBtn && bankPane) {
+      var tabs = document.querySelectorAll('.tab');
+      for (var i=0;i<tabs.length;i++) tabs[i].classList.remove('active');
+      var panes = document.querySelectorAll('.tab-pane');
+      for (var j=0;j<panes.length;j++) panes[j].classList.remove('active');
+      bankBtn.classList.add('active');
+      bankPane.classList.add('active');
+    }
+  } catch(e){ console.log('hide tab', e); }
+
+  // 2. renderStudentView - renders task the way student sees it
+  window._renderStudentView = function(t, d){
+    var h = '';
+    if (d.instruction) h += '<div style="font-style:italic;color:#555;margin-bottom:12px;line-height:1.5;font-size:13px">' + esc(d.instruction) + '</div>';
+    if (t === '1'){
+      (d.statements||[]).forEach(function(s){h += '<div style="margin:4px 0;color:#333"><b>' + s.number + '.</b> ' + esc(s.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">Говорящий</th>';
+      'ABCDEF'.split('').forEach(function(k){h += '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';});
+      h += '</tr><tr><td style="border:1px solid #000;padding:6px 14px;color:#000">Ответ</td>';
+      'ABCDEF'.split('').forEach(function(){h += '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';});
+      h += '</tr></table>';
+    } else if (t === '2'){
+      (d.statements||[]).forEach(function(s){h += '<div style="margin:4px 0;color:#333"><b>' + esc(s.letter) + '.</b> ' + esc(s.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">Утв.</th>';
+      'ABCDEFG'.split('').forEach(function(k){h += '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';});
+      h += '</tr><tr><td style="border:1px solid #000;padding:6px 14px;color:#000">Ответ</td>';
+      'ABCDEFG'.split('').forEach(function(){h += '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';});
+      h += '</tr></table>';
+      h += '<div style="font-size:11px;color:#666">1 – True, 2 – False, 3 – Not stated</div>';
+    } else if (t === '3-9'){
+      (d.questions||[]).forEach(function(q){
+        h += '<div style="margin:10px 0;color:#333"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+        ['1','2','3'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(q.options[k]) + '</div>';});
+      });
+    } else if (t === '10'){
+      (d.headings||[]).forEach(function(x){h += '<div style="margin:2px 0;color:#333"><b>' + x.number + '.</b> ' + esc(x.text) + '</div>';});
+      h += '<hr style="margin:12px 0;border:none;border-top:1px solid #999">';
+      (d.texts||[]).forEach(function(x){h += '<div style="margin:10px 0;color:#333;line-height:1.5"><b>' + esc(x.letter) + '.</b> ' + esc(x.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr>' + 'ABCDEFG'.split('').map(function(k){return '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';}).join('') + '</tr>';
+      h += '<tr>' + 'ABCDEFG'.split('').map(function(){return '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';}).join('') + '</tr></table>';
+    } else if (t === '11'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;margin-bottom:12px;color:#333">' + esc(d.text) + '</div>';
+      (d.fragments||[]).forEach(function(f){h += '<div style="margin:2px 0;color:#333"><b>' + f.number + '.</b> ' + esc(f.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr>' + 'ABCDEF'.split('').map(function(k){return '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';}).join('') + '</tr>';
+      h += '<tr>' + 'ABCDEF'.split('').map(function(){return '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';}).join('') + '</tr></table>';
+    } else if (t === '12-18'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;margin-bottom:12px;color:#333">' + esc(d.text) + '</div>';
+      (d.questions||[]).forEach(function(q){
+        h += '<div style="margin:10px 0;color:#333"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+        ['1','2','3','4'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(q.options[k]) + '</div>';});
+      });
+    } else if (t === '19-24' || t === '25-29'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.8;color:#333">' + esc(d.text) + '</div>';
+      h += '<hr style="margin:12px 0;border:none;border-top:1px solid #999">';
+      (d.items||[]).forEach(function(it){
+        h += '<div style="margin:6px 0;color:#333"><b>' + it.number + '.</b> <span style="font-family:monospace;letter-spacing:1px">' + esc(it.source_word) + '</span> -&gt; _________________</div>';
+      });
+    } else if (t === '30-36'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333">' + esc(d.text) + '</div>';
+      (d.items||[]).forEach(function(it){
+        h += '<div style="margin:10px 0;color:#333"><b>' + it.number + '.</b></div>';
+        ['1','2','3','4'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(it.options[k]) + '</div>';});
+      });
+    } else if (t === '37'){
+      if (d.task_text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333;margin-bottom:12px">' + esc(d.task_text) + '</div>';
+      h += '<div style="background:#f5f5f5;border:1px dashed #999;padding:14px;border-radius:6px;color:#666;font-style:italic;text-align:center;font-size:13px">Здесь у ученика будет окно для ввода ответа (90-154 слова) и кнопка «Отправить на проверку»</div>';
+    } else if (t === '38.1' || t === '38.2'){
+      if (d.task_text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333;margin-bottom:12px">' + esc(d.task_text) + '</div>';
+      if (d.survey_data && d.survey_data.options){
+        if (d.survey_data.question) h += '<div style="text-align:center;font-weight:700;margin:12px 0 8px;color:#000">' + esc(d.survey_data.question) + '</div>';
+        h += '<table style="border-collapse:collapse;margin:8px 0;width:100%">';
+        h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000;text-align:left">Options</th><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000;width:100px;text-align:center">Number of respondents (%)</th></tr>';
+        (d.survey_data.options||[]).forEach(function(o){h += '<tr><td style="border:1px solid #000;padding:6px 14px;color:#333">' + esc(o.option) + '</td><td style="border:1px solid #000;padding:6px 14px;color:#333;text-align:center">' + esc(o.percent) + '</td></tr>';});
+        h += '</table>';
+      }
+      if (d.plan && d.plan.length){
+        h += '<div style="font-weight:700;margin:12px 0 6px;color:#000">Use the following plan:</div>';
+        d.plan.forEach(function(p){h += '<div style="margin:2px 0 2px 20px;color:#333">- ' + esc(p) + '</div>';});
+      }
+      h += '<div style="background:#f5f5f5;border:1px dashed #999;padding:14px;border-radius:6px;color:#666;font-style:italic;text-align:center;font-size:13px;margin-top:12px">Здесь у ученика будет окно для ввода ответа (200-250 слов) и кнопка «Отправить на проверку»</div>';
+    }
+    if (d.answer_key && Object.keys(d.answer_key).length){
+      h += '<div style="margin-top:16px;padding:10px 14px;background:#fff8d8;border:1px solid #b8860b;border-radius:6px;color:#000"><b>Ключ (только для админа):</b><br>';
+      var parts = [];
+      Object.keys(d.answer_key).forEach(function(k){parts.push(k + '-' + d.answer_key[k]);});
+      h += '<span style="font-family:monospace;color:#8b6508;font-weight:700;font-size:13px">' + parts.join('  ') + '</span></div>';
+    }
+    if (d.explanations && Object.keys(d.explanations).length){
+      h += '<details style="margin-top:12px;background:#eef7ee;border:1px solid #4a8f4a;border-radius:6px;padding:10px;color:#000"><summary style="cursor:pointer;color:#2e6b2e;font-weight:700">Объяснения</summary><div style="margin-top:8px">';
+      Object.keys(d.explanations).forEach(function(k){
+        h += '<div style="margin:4px 0;font-size:13px"><b style="color:#2e6b2e">' + esc(k) + ':</b> ' + esc(d.explanations[k]) + '</div>';
+      });
+      h += '</div></details>';
+    }
+    return h;
+  };
+
+  // 3. Import preview: student-style
+  window.renderImportPreview = function(td, t, topic){
+    var res = document.getElementById('impRes');
+    if (!res) return;
+    var h = '';
+    h += '<div class="panel" style="background:rgba(123,92,255,.08);border:1px solid rgba(123,92,255,.4);margin-top:14px">';
+    h += '<h3 style="color:#c9b8ff;margin-bottom:10px">Предпросмотр: задание ' + esc(t) + ' (' + esc(topic) + ')</h3>';
+    h += '<div style="background:#fff;color:#000;padding:20px;border-radius:8px;max-height:600px;overflow:auto;font-family:Times New Roman,serif;font-size:12pt;line-height:1.4">';
+    h += window._renderStudentView(t, td);
+    h += '</div>';
+    h += '<div style="display:flex;gap:12px;margin-top:16px">';
+    h += '<button class="btn btn-ok" style="width:auto;padding:12px 24px" onclick="importConfirmSave()">Сохранить в банк</button>';
+    h += '<button class="btn btn-cancel" style="width:auto;padding:12px 24px" onclick="importCancelPreview()">Отменить</button>';
+    h += '</div>';
+    h += '<details style="margin-top:10px"><summary style="cursor:pointer;color:#8b93c4;font-size:12px">Показать JSON</summary><pre style="color:#a0a8d0;font-size:11px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:200px;overflow:auto;margin-top:8px">' + esc(JSON.stringify(td, null, 2)) + '</pre></details>';
+    h += '</div>';
+    res.className = '';
+    res.innerHTML = h;
+  };
+
+  // 4. Bank viewer: full task
+  window.openTask = async function(task_type, topic_letter, code){
+    var v = document.getElementById('bankList');
+    v.innerHTML = '<div class="res">Загружаю ' + esc(code) + '...</div>';
+    try {
+      var d = await api({action:'get_bank_task', task_type:task_type, topic_letter:topic_letter, code:code});
+      if (d.error){ v.innerHTML = '<div class="res err">Ошибка: ' + esc(d.error) + '</div>'; return; }
+      _loadedBankTask = d;
+      _loadedBankTask.task_type = task_type;
+      var h = '<div class="res ok" style="margin-top:12px">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><b style="font-family:monospace;font-size:16px">' + esc(d.code) + '</b><button class="btn btn-sm btn-outline" onclick="listBank()">Закрыть</button></div>';
+      if (d.audio_b64){
+        var bytes = b64ToBytes(d.audio_b64);
+        var url = URL.createObjectURL(new Blob([bytes], {type:'audio/mpeg'}));
+        h += '<audio controls src="' + url + '" style="width:100%;margin:8px 0"></audio>';
+      }
+      h += '<div style="background:#fff;color:#000;padding:20px;border-radius:8px;max-height:600px;overflow:auto;font-family:Times New Roman,serif;font-size:12pt;line-height:1.4;margin-top:12px">';
+      h += window._renderStudentView(task_type, d);
+      h += '</div>';
+      h += '<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(123,92,255,.2)"><b style="color:#c9b8ff">Скачать PDF:</b><br>';
+      h += '<button class="btn btn-sm btn-outline" style="margin-right:8px;margin-top:8px" onclick="downloadLoadedBankTask(false)">Для ученика</button>';
+      h += '<button class="btn btn-sm" style="margin-top:8px" onclick="downloadLoadedBankTask(true)">Для учителя</button></div>';
+      h += '</div>';
+      v.innerHTML = h;
+    } catch(e){ v.innerHTML = '<div class="res err">Ошибка: ' + esc(e.message) + '</div>'; }
+  };
+
+  // 5. PDF via html2pdf
+  window._loadHtml2PdfOnce = function(cb){
+    if (typeof html2pdf !== 'undefined') { cb(true); return; }
+    var urls = [
+      'https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js',
+      'https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.1/dist/html2pdf.bundle.min.js'
+    ];
+    var i = 0;
+    (function next(){
+      if (i >= urls.length) { cb(false); return; }
+      var s = document.createElement('script');
+      s.src = urls[i++];
+      s.onload = function(){ cb(typeof html2pdf !== 'undefined'); };
+      s.onerror = next;
+      document.head.appendChild(s);
+    })();
+  };
+
+  window.openPrintWindow = function(bodyHtml, title){
+    window._loadHtml2PdfOnce(function(ok){
+      if (!ok) {
+        var w = window.open('', '_blank');
+        if (w) {
+          var doc = '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + esc(title) + '</title><style>' + (typeof PRINT_CSS !== 'undefined' ? PRINT_CSS : '') + '</style></head><body class="print-body"><div class="print-doc">' + bodyHtml + '</div><scr' + 'ipt>window.addEventListener("load",function(){setTimeout(function(){window.print();},500);});</scr' + 'ipt></body></html>';
+          w.document.open(); w.document.write(doc); w.document.close();
+        }
+        return;
+      }
+      var c = document.createElement('div');
+      c.className = 'print-doc';
+      c.style.cssText = 'position:fixed;top:0;left:0;width:210mm;background:#fff;color:#000;z-index:99999;padding:20px;opacity:0;pointer-events:none;font-family:"Times New Roman",Times,serif;font-size:12pt;line-height:1.4';
+      c.innerHTML = bodyHtml;
+      document.body.appendChild(c);
+      var safe = (title || 'document').replace(/[^A-Za-zА-Яа-я0-9_ -]+/g, '_').trim() || 'document';
+      setTimeout(function(){
+        var opt = {
+          margin: [10,10,10,10],
+          filename: safe + '.pdf',
+          image: { type:'jpeg', quality:0.95 },
+          html2canvas: { scale:2, useCORS:true, logging:false, backgroundColor:'#ffffff', scrollX:0, scrollY:0, windowWidth:794 },
+          jsPDF: { unit:'mm', format:'a4', orientation:'portrait' },
+          pagebreak: { mode:['css','legacy'] }
+        };
+        html2pdf().set(opt).from(c).output('datauristring').then(function(dataUri){
+          if (c.parentNode) c.parentNode.removeChild(c);
+          var a = document.createElement('a');
+          a.href = dataUri;
+          a.download = safe + '.pdf';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function(){ document.body.removeChild(a); }, 500);
+        }).catch(function(err){
+          if (c.parentNode) c.parentNode.removeChild(c);
+          console.error('pdf err', err);
+          alert('PDF: ' + (err && err.message ? err.message : err));
+        });
+      }, 400);
+    });
+  };
+})();
+
+// SERVER_PDF_OVERRIDE
+(function(){
+  window._serverPdf = async function(taskType, taskData, withAnswers, filename){
+    try {
+      var res = await fetch(window.location.pathname, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'pdf_download', task_type: taskType, task_data: taskData, with_answers: !!withAnswers})
+      });
+      var d = await res.json();
+      if (d.error) { alert('Ошибка: ' + d.error); return; }
+      if (!d.pdf) { alert('Пустой PDF'); return; }
+      var bin = atob(d.pdf);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      var blob = new Blob([bytes], {type:'application/pdf'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = (filename || ('task_' + taskType)) + '.pdf';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1500);
+    } catch(e) {
+      alert('Ошибка: ' + e.message);
+    }
+  };
+
+  window.downloadLoadedBankTask = function(withAnswers){
+    if (!_loadedBankTask) { alert('Ничего не загружено'); return; }
+    var t = _loadedBankTask.task_type;
+    var name = 'Задание_' + t + (_loadedBankTask.code ? ('_' + _loadedBankTask.code) : '') + (withAnswers ? '_с_ответами' : '');
+    window._serverPdf(t, _loadedBankTask, withAnswers, name);
+  };
+
+  window.downloadTaskPDF = function(){
+    var d = window._taskData;
+    if (!d) { alert('Задание не загружено'); return; }
+    var t = (d._meta && d._meta.task_type) || d.task_type || '';
+    window._serverPdf(t, d, false, 'Задание_' + t);
+  };
+})();
+
+// FIX38D
+(function(){
+  function _clean38(d){
+    if (!d || !d.task_text) return d;
+    var tt = String(d.task_text);
+    if (tt.toLowerCase().indexOf('imagine') < 0) return d;
+    var lines = tt.split(/\n+/);
+    var keep = [];
+    for (var i = 0; i < lines.length; i++){
+      var s = lines[i].trim();
+      if (!s) continue;
+      var l = s.toLowerCase();
+      if (l.indexOf('imagine that') === 0 || l.indexOf('comment on') === 0 || l.indexOf('[38.1]') === 0 || l.indexOf('[38.2]') === 0) {
+        keep.push(s);
+      }
+    }
+    if (!keep.length) return d;
+    var d2 = {};
+    for (var k in d) if (Object.prototype.hasOwnProperty.call(d, k)) d2[k] = d[k];
+    d2.task_text = keep.join(' ');
+    return d2;
+  }
+
+  function _wrap38(){
+    var orig = window.renderTaskForPrint;
+    if (typeof orig !== 'function' || orig.__is38d) return;
+    var wrapped = function(t, d, opts){
+      if (t === '38.1' || t === '38.2') d = _clean38(d);
+      return orig.call(this, t, d, opts);
+    };
+    wrapped.__is38d = true;
+    window.renderTaskForPrint = wrapped;
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wrap38);
+  } else {
+    _wrap38();
+  }
+  setTimeout(_wrap38, 500);
+  setTimeout(_wrap38, 1500);
+})();
+
 </script>
 </body>
 </html>"""
@@ -4817,6 +5786,7 @@ select option{background:#0d1030;color:var(--text)}
   <button class="tab" data-tab="materials" onclick="switchTab('materials')">📎 Материалы</button>
   <button class="tab" data-tab="assignments" onclick="switchTab('assignments')">🎯 Назначения</button>
   <button class="tab" data-tab="stats" onclick="switchTab('stats')">📊 Статистика</button>
+  <button class="tab" data-tab="import" onclick="switchTab('import')">📥 Импорт</button>
   <button class="tab" data-tab="ratelimit" onclick="switchTab('ratelimit')">🚦 Лимиты</button>
 </div>
 
@@ -5022,6 +5992,56 @@ Speaker A: ...
   <div class="panel"><h3>📈 По ученикам</h3><div id="statsTable"><div class="empty">Загрузка…</div></div></div>
 </div>
 
+<div class="tab-pane" id="pane-import">
+  <div class="panel">
+    <h3>📥 Импорт задания</h3>
+    <p class="hint">Формулировка задания подставится автоматически. Вставь только данные из PDF.</p>
+    <div class="row">
+      <div class="f"><label>Тип</label>
+        <select id="impType" onchange="impOnTypeChange()">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3-9">3–9</option>
+          <option value="10">10</option>
+          <option value="11">11</option>
+          <option value="12-18">12–18</option>
+          <option value="19-24">19–24</option>
+          <option value="25-29">25–29</option>
+          <option value="30-36">30–36</option>
+          <option value="37">37</option>
+          <option value="38.1">38.1</option>
+          <option value="38.2">38.2</option>
+        </select>
+      </div>
+      <div class="f"><label>Тема</label>
+        <select id="impTopic">
+          <option value="А">А</option><option value="Б">Б</option>
+          <option value="В">В</option><option value="Г">Г</option>
+          <option value="Д">Д</option><option value="Е">Е</option>
+          <option value="Ж">Ж</option><option value="З">З</option>
+          <option value="И">И</option><option value="К">К</option>
+          <option value="Л">Л</option><option value="М">М</option>
+          <option value="Н">Н</option><option value="О">О</option>
+          <option value="П">П</option><option value="Р">Р</option>
+          <option value="С">С</option>
+        </select>
+      </div>
+    </div>
+    <div class="f"><label>Данные задания (вставить из PDF)</label>
+      <textarea id="impText" style="min-height:220px"></textarea>
+    </div>
+    <div class="f" id="impAudioWrap" style="display:none">
+      <label>Текст для озвучки (Name (M): / Name (F): / Speaker A:)</label>
+      <textarea id="impAudio" style="min-height:180px"></textarea>
+    </div>
+    <div class="f"><label>Ключ (ответы)</label>
+      <textarea id="impKey" style="min-height:70px"></textarea>
+    </div>
+    <button class="btn btn-ok" id="impBtn" onclick="importPreviewStart()">🔍 Разобрать и сохранить</button>
+    <div id="impRes" style="margin-top:12px"></div>
+  </div>
+</div>
+
 <div class="tab-pane" id="pane-ratelimit">
   <div class="panel">
     <h3>🚦 Лимиты</h3>
@@ -5185,24 +6205,48 @@ function renderTaskForPrint(t, d, opts){
     if(d.task_text) h+='<div class="tt">'+esc(d.task_text)+'</div>';
     h+='<h3 style="margin-top:14pt">Answer sheet</h3>';
     for(var i=0;i<22;i++) h+='<div style="border-bottom:1pt dotted #888;height:22pt"></div>';
-  } else if(t==='38.1'||t==='38.2'){
-    if(d.task_text) h+='<div class="tt">'+esc(d.task_text)+'</div>';
+  } else if(t==='38.1'||t==='38.2'){  /* FIX38C */
     var sd = d.survey_data || {};
-    if(sd.question) h+='<p style="text-align:center;font-weight:bold">The survey question: &laquo;'+esc(String(sd.question).replace(/^"+|"+$/g,''))+'&raquo;</p>';
-    if(t==='38.1'){
-      h+='<table><tr><th>Options</th><th>Number of respondents (%)</th></tr>';
-      (sd.options||[]).forEach(function(o){h+='<tr><td>'+esc(o.option)+'</td><td style="text-align:center">'+esc(o.percent)+'</td></tr>';});
-      h+='</table>';
-    } else {
-      h+='<table><tr><th>Segment</th><th>%</th></tr>';
-      (sd.options||[]).forEach(function(o){h+='<tr><td>'+esc(o.option)+'</td><td style="text-align:center">'+esc(o.percent)+'</td></tr>';});
-      h+='</table>';
+    var _tt = d.task_text || '';
+    var _intro = '';
+    var _lines = _tt.split(/\n+/);
+    var _kept = [];
+    for (var _i = 0; _i < _lines.length; _i++) {
+      var _s = _lines[_i].trim();
+      if (!_s) continue;
+      var _l = _s.toLowerCase();
+      if (_l.indexOf('imagine that') === 0 || _l.indexOf('comment on') === 0) {
+        _kept.push(_s);
+      }
     }
-    h+='<p style="margin-top:12pt"><b>Write 200–250 words.</b></p>';
-    h+='<p><b>Use the following plan:</b></p>';
-    (d.plan||[]).forEach(function(p){h+='<div style="margin-left:18pt">– '+esc(p)+'</div>';});
-    h+='<h3 style="margin-top:14pt">Answer sheet</h3>';
-    for(var j=0;j<22;j++) h+='<div style="border-bottom:1pt dotted #888;height:22pt"></div>';
+    _intro = _kept.join(' ');
+    if (_intro) h += '<div class="tt">' + esc(_intro) + '</div>';
+    if (sd.question) {
+      var _q = String(sd.question).replace(/^"+|"+$/g, '').replace(/\s*Choose one option\s*$/, '').trim();
+      h += '<p style="text-align:center;font-weight:bold">The survey question: &laquo;' + esc(_q) + '&raquo;</p>';
+    }
+    if (t === '38.1') {
+      h += '<table><tr><th>Options</th><th>Number of respondents (%)</th></tr>';
+      (sd.options || []).forEach(function(o) {
+        h += '<tr><td>' + esc(o.option) + '</td><td style="text-align:center">' + esc(o.percent) + '</td></tr>';
+      });
+      h += '</table>';
+    } else {
+      h += '<table><tr><th>Segment</th><th>%</th></tr>';
+      (sd.options || []).forEach(function(o) {
+        h += '<tr><td>' + esc(o.option) + '</td><td style="text-align:center">' + esc(o.percent) + '</td></tr>';
+      });
+      h += '</table>';
+    }
+    h += '<p style="margin-top:12pt"><b>Write 200\u2013250 words.</b></p>';
+    if (d.plan && d.plan.length) {
+      h += '<p><b>Use the following plan:</b></p>';
+      d.plan.forEach(function(p) {
+        h += '<div style="margin-left:18pt">\u2013 ' + esc(p) + '</div>';
+      });
+    }
+    h += '<h3 style="margin-top:14pt">Answer sheet</h3>';
+    for (var j = 0; j < 22; j++) h += '<div style="border-bottom:1pt dotted #888;height:22pt"></div>';
   }
   return h;
 }
@@ -6046,8 +7090,564 @@ async function loadAudit(){
   v.innerHTML=h+'</div>';
 }
 
+var _impPreview = null;
+
+async function importPreviewStart() {
+  var t = document.getElementById('impType').value;
+  var topic = document.getElementById('impTopic').value;
+  var txt = document.getElementById('impText').value.trim();
+  var aud = document.getElementById('impAudio').value.trim();
+  var key = document.getElementById('impKey').value.trim();
+  var res = document.getElementById('impRes');
+  var btn = document.getElementById('impBtn');
+  if (!txt) { res.className = 'res err'; res.textContent = '\u041d\u0443\u0436\u0435\u043d \u0442\u0435\u043a\u0441\u0442 \u0437\u0430\u0434\u0430\u043d\u0438\u044f'; return; }
+  res.className = 'res';
+  res.textContent = '\u0420\u0430\u0437\u0431\u0438\u0440\u0430\u044e... 20-40 \u0441\u0435\u043a.';
+  btn.disabled = true;
+  btn.textContent = '\u23f3 \u0418\u0434\u0451\u0442 \u0440\u0430\u0437\u0431\u043e\u0440...';
+  _impPreview = null;
+  try {
+    var d = await api({action:'import_preview', task_type:t, task_text:txt, audio_text:aud, key_text:key});
+    if (d.error) {
+      res.className = 'res err';
+      res.textContent = '\u041e\u0448\u0438\u0431\u043a\u0430: ' + d.error;
+      btn.disabled = false;
+      btn.textContent = '\U0001f50d \u0420\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c';
+      return;
+    }
+    _impPreview = {task_type: t, topic: topic, task_data: d.task_data};
+    renderImportPreview(d.task_data, t, topic);
+    btn.disabled = false;
+    btn.textContent = '\U0001f50d \u0420\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c';
+  } catch(e) {
+    res.className = 'res err';
+    res.textContent = '\u041e\u0448\u0438\u0431\u043a\u0430: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = '\U0001f50d \u0420\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c';
+  }
+}
+
+async function importConfirmSave() {
+  if (!_impPreview) { alert('\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u0440\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c'); return; }
+  var res = document.getElementById('impRes');
+  var btn = document.getElementById('impConfirmBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 \u0421\u043e\u0445\u0440\u0430\u043d\u044f\u044e...'; }
+  try {
+    var d = await api({action:'import_save', task_type:_impPreview.task_type, topic_letter:_impPreview.topic, task_data:_impPreview.task_data});
+    if (d.error) { alert('\u041e\u0448\u0438\u0431\u043a\u0430: ' + d.error); if (btn) { btn.disabled = false; btn.textContent = '\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0432 \u0431\u0430\u043d\u043a'; } return; }
+    _impPreview = null;
+    res.className = 'res ok';
+    res.innerHTML = '\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e! \u041a\u043e\u0434: <code>' + esc(d.code) + '</code>';
+    document.getElementById('impText').value = '';
+    document.getElementById('impAudio').value = '';
+    document.getElementById('impKey').value = '';
+  } catch(e) {
+    alert('\u041e\u0448\u0438\u0431\u043a\u0430: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0432 \u0431\u0430\u043d\u043a'; }
+  }
+}
+
+function importCancelPreview() {
+  _impPreview = null;
+  var res = document.getElementById('impRes');
+  res.className = '';
+  res.innerHTML = '';
+}
+
+function _impTabRow(letter, text) {
+  return '<tr><td style="padding:6px 10px;color:#c9b8ff;font-weight:700;border:1px solid rgba(123,92,255,.2)">' + esc(letter) + '</td>'
+       + '<td style="padding:6px 10px;border:1px solid rgba(123,92,255,.2)">' + esc(text) + '</td></tr>';
+}
+
+function renderImportPreview(td, t, topic) {
+  var res = document.getElementById('impRes');
+  var h = '';
+  h += '<div class="panel" style="background:rgba(123,92,255,.08);border:1px solid rgba(123,92,255,.4);margin-top:14px">';
+  h += '<h3 style="color:#c9b8ff;margin-bottom:10px">\u041f\u0440\u0435\u0434\u043f\u0440\u043e\u0441\u043c\u043e\u0442\u0440 \u2014 \u0437\u0430\u0434\u0430\u043d\u0438\u0435 ' + esc(t) + ' (' + esc(topic) + ')</h3>';
+
+  if (td.instruction) {
+    h += '<div style="background:rgba(5,6,15,.5);padding:12px;border-radius:8px;color:#d0d5f5;font-size:13px;line-height:1.6;margin-bottom:12px;font-style:italic">' + esc(td.instruction) + '</div>';
+  }
+
+  if (t === '1' || t === '2') {
+    var items = td.statements || [];
+    h += '<div style="color:#c9b8ff;font-weight:700;margin-bottom:6px">\u0423\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f (' + items.length + '):</div>';
+    items.forEach(function(s){
+      var lab = t === '1' ? s.number : s.letter;
+      h += '<div style="color:#d0d5f5;font-size:13px;margin:3px 0"><b>' + esc(lab) + '.</b> ' + esc(s.text) + '</div>';
+    });
+    if (t === '1') {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0421\u043a\u0440\u0438\u043f\u0442\u044b (\u0433\u043e\u043b\u043e\u0441\u0430 A-F):</div>';
+      (td.scripts || []).forEach(function(s){
+        h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>Speaker ' + esc(s.speaker) + ':</b> ' + esc(String(s.text).slice(0,80)) + '...</div>';
+      });
+    } else if (t === '2') {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0414\u0438\u0430\u043b\u043e\u0433 (' + (td.dialogue_script||[]).length + ' \u0440\u0435\u043f\u043b\u0438\u043a):</div>';
+      (td.dialogue_script || []).slice(0,4).forEach(function(s){
+        h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + esc(s.speaker) + ' (' + esc(s.gender||'?') + '):</b> ' + esc(String(s.text).slice(0,70)) + '...</div>';
+      });
+    }
+  } else if (t === '3-9') {
+    h += '<div style="color:#c9b8ff;font-weight:700;margin-bottom:6px">\u0412\u043e\u043f\u0440\u043e\u0441\u044b (' + (td.questions||[]).length + '):</div>';
+    (td.questions || []).forEach(function(q){
+      h += '<div style="color:#d0d5f5;font-size:13px;margin:4px 0"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+      ['1','2','3'].forEach(function(k){
+        h += '<div style="color:#a0a8d0;font-size:12px;margin-left:14px">' + k + ') ' + esc(q.options[k]) + '</div>';
+      });
+    });
+    h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0418\u043d\u0442\u0435\u0440\u0432\u044c\u044e (' + (td.interview_script||[]).length + ' \u0440\u0435\u043f\u043b\u0438\u043a):</div>';
+    (td.interview_script || []).slice(0,3).forEach(function(s){
+      h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + esc(s.speaker) + ' (' + esc(s.gender||'?') + '):</b> ' + esc(String(s.text).slice(0,70)) + '...</div>';
+    });
+  } else if (t === '10') {
+    h += '<div style="color:#c9b8ff;font-weight:700;margin-bottom:6px">\u0417\u0430\u0433\u043e\u043b\u043e\u0432\u043a\u0438 (' + (td.headings||[]).length + '):</div>';
+    (td.headings || []).forEach(function(x){
+      h += '<div style="color:#d0d5f5;font-size:13px;margin:2px 0"><b>' + x.number + '.</b> ' + esc(x.text) + '</div>';
+    });
+    h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0422\u0435\u043a\u0441\u0442\u044b (' + (td.texts||[]).length + '):</div>';
+    (td.texts || []).forEach(function(x){
+      h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + esc(x.letter) + '.</b> ' + esc(String(x.text).slice(0,80)) + '...</div>';
+    });
+  } else if (t === '11') {
+    if (td.title) h += '<div style="color:#d0d5f5;font-size:13px;margin-bottom:6px"><b>' + esc(td.title) + '</b></div>';
+    h += '<div style="color:#d0d5f5;font-size:12px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:200px;overflow-y:auto;white-space:pre-wrap">' + esc(td.text || '') + '</div>';
+    h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u044b:</div>';
+    (td.fragments || []).forEach(function(x){
+      h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + x.number + '.</b> ' + esc(x.text) + '</div>';
+    });
+  } else if (t === '12-18' || t === '30-36') {
+    if (td.title) h += '<div style="color:#d0d5f5;font-size:13px;margin-bottom:6px"><b>' + esc(td.title) + '</b></div>';
+    h += '<div style="color:#d0d5f5;font-size:12px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:180px;overflow-y:auto;white-space:pre-wrap">' + esc(td.text || '') + '</div>';
+    if (t === '12-18') {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0412\u043e\u043f\u0440\u043e\u0441\u044b:</div>';
+      (td.questions || []).forEach(function(q){
+        h += '<div style="color:#d0d5f5;font-size:13px;margin:4px 0"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+      });
+    } else {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0417\u0430\u0434\u0430\u043d\u0438\u044f (' + (td.items||[]).length + '):</div>';
+      (td.items || []).forEach(function(it){
+        h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + it.number + '.</b> ' + (it.options ? esc([it.options['1'],it.options['2'],it.options['3'],it.options['4']].join(' / ')) : '') + '</div>';
+      });
+    }
+  } else if (t === '19-24' || t === '25-29') {
+    if (td.title) h += '<div style="color:#d0d5f5;font-size:13px;margin-bottom:6px"><b>' + esc(td.title) + '</b></div>';
+    h += '<div style="color:#d0d5f5;font-size:12px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:180px;overflow-y:auto;white-space:pre-wrap">' + esc(td.text || '') + '</div>';
+    h += '<div style="color:#c9b8ff;font-weight:700;margin:10px 0 6px">\u0411\u0430\u0437\u043e\u0432\u044b\u0435 \u0441\u043b\u043e\u0432\u0430:</div>';
+    (td.items || []).forEach(function(it){
+      h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0"><b>' + it.number + '.</b> <span style="font-family:monospace">' + esc(it.source_word) + '</span></div>';
+    });
+  } else if (t === '37' || t === '38.1' || t === '38.2') {
+    h += '<div style="color:#d0d5f5;font-size:13px;background:rgba(5,6,15,.5);padding:14px;border-radius:8px;white-space:pre-wrap;line-height:1.7">' + esc(td.task_text || '') + '</div>';
+    if (td.survey_data && td.survey_data.options) {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:12px 0 6px">\u0414\u0430\u043d\u043d\u044b\u0435 \u043e\u043f\u0440\u043e\u0441\u0430:</div>';
+      h += '<div style="color:#a0a8d0;font-size:12px;margin-bottom:6px">' + esc(td.survey_data.question || '') + '</div>';
+      h += '<table style="width:100%;border-collapse:collapse;margin:6px 0">';
+      h += '<tr><th style="padding:6px 10px;background:rgba(123,92,255,.15);border:1px solid rgba(123,92,255,.2);color:#c9b8ff;text-align:left">Options</th>';
+      h += '<th style="padding:6px 10px;background:rgba(123,92,255,.15);border:1px solid rgba(123,92,255,.2);color:#c9b8ff;width:120px;text-align:center">%</th></tr>';
+      (td.survey_data.options || []).forEach(function(o){
+        h += '<tr><td style="padding:6px 10px;border:1px solid rgba(123,92,255,.2);color:#d0d5f5;font-size:13px">' + esc(o.option) + '</td>';
+        h += '<td style="padding:6px 10px;border:1px solid rgba(123,92,255,.2);color:#d0d5f5;font-size:13px;text-align:center">' + esc(o.percent) + '</td></tr>';
+      });
+      h += '</table>';
+    }
+    if (td.plan && td.plan.length) {
+      h += '<div style="color:#c9b8ff;font-weight:700;margin:12px 0 6px">\u041f\u043b\u0430\u043d:</div>';
+      td.plan.forEach(function(p){ h += '<div style="color:#d0d5f5;font-size:12px;margin:2px 0;margin-left:10px">\u2013 ' + esc(p) + '</div>'; });
+    }
+  }
+
+  if (td.answer_key && Object.keys(td.answer_key).length) {
+    h += '<div style="color:#c9b8ff;font-weight:700;margin:12px 0 6px">\u041a\u043b\u044e\u0447:</div>';
+    h += '<div style="color:#00e5ff;font-family:monospace;font-size:13px;background:rgba(5,6,15,.5);padding:8px 12px;border-radius:6px">';
+    var parts = [];
+    Object.keys(td.answer_key).forEach(function(k){ parts.push(k + '\u2192' + td.answer_key[k]); });
+    h += parts.join('  ');
+    h += '</div>';
+  }
+
+  h += '<details style="margin-top:12px"><summary style="cursor:pointer;color:#8b93c4;font-size:12px">\u041f\u043e\u043a\u0430\u0437\u0430\u0442\u044c JSON</summary>';
+  h += '<pre style="color:#a0a8d0;font-size:11px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:300px;overflow:auto;margin-top:8px">' + esc(JSON.stringify(td, null, 2)) + '</pre></details>';
+
+  h += '<div style="display:flex;gap:12px;margin-top:16px">';
+  h += '<button class="btn btn-ok" id="impConfirmBtn" style="width:auto;padding:12px 24px" onclick="importConfirmSave()">\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0432 \u0431\u0430\u043d\u043a</button>';
+  h += '<button class="btn btn-cancel" style="width:auto;padding:12px 24px" onclick="importCancelPreview()">\u274c \u041e\u0442\u043c\u0435\u043d\u0438\u0442\u044c</button>';
+  h += '</div>';
+
+  h += '</div>';
+  res.className = '';
+  res.innerHTML = h;
+}
+
+function impOnTypeChange() {
+  var t = document.getElementById('impType').value;
+  var wrap = document.getElementById('impAudioWrap');
+  if (wrap) wrap.style.display = (t === '1' || t === '2' || t === '3-9') ? 'block' : 'none';
+}
+async function importTask() {
+  var t = document.getElementById('impType').value;
+  var topic = document.getElementById('impTopic').value;
+  var txt = document.getElementById('impText').value.trim();
+  var aud = document.getElementById('impAudio').value.trim();
+  var key = document.getElementById('impKey').value.trim();
+  var res = document.getElementById('impRes');
+  var btn = document.getElementById('impBtn');
+  if (!txt) { res.className = 'res err'; res.textContent = '\u041d\u0443\u0436\u0435\u043d \u0442\u0435\u043a\u0441\u0442 \u0437\u0430\u0434\u0430\u043d\u0438\u044f'; return; }
+  res.className = 'res';
+  res.textContent = '\u0420\u0430\u0437\u0431\u0438\u0440\u0430\u044e... 20-40 \u0441\u0435\u043a.';
+  btn.disabled = true;
+  btn.textContent = '\u23f3 \u0418\u0434\u0451\u0442 \u0440\u0430\u0437\u0431\u043e\u0440...';
+  try {
+    var d = await api({action:'import_task', task_type:t, topic_letter:topic, task_text:txt, audio_text:aud, key_text:key});
+    if (d.error) {
+      res.className = 'res err';
+      res.textContent = '\u041e\u0448\u0438\u0431\u043a\u0430: ' + d.error;
+      btn.disabled = false;
+      btn.textContent = '\U0001f50d \u0420\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c';
+      return;
+    }
+    res.className = 'res ok';
+    res.innerHTML = '\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e! \u041a\u043e\u0434: <code>' + esc(d.code) + '</code>';
+    document.getElementById('impText').value = '';
+    document.getElementById('impAudio').value = '';
+    document.getElementById('impKey').value = '';
+  } catch(e) {
+    res.className = 'res err';
+    res.textContent = '\u041e\u0448\u0438\u0431\u043a\u0430: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '\U0001f50d \u0420\u0430\u0437\u043e\u0431\u0440\u0430\u0442\u044c \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c';
+  }
+}
+
+(function hideUploadTab(){
+  try {
+    var btn = document.querySelector('[data-tab="upload"]');
+    if (btn) btn.style.display = 'none';
+    var pane = document.getElementById('pane-upload');
+    if (pane) pane.style.display = 'none';
+    var bankBtn = document.querySelector('[data-tab="bank"]');
+    var bankPane = document.getElementById('pane-bank');
+    if (bankBtn && bankPane) {
+      var tabs = document.querySelectorAll('.tab');
+      for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+      var panes = document.querySelectorAll('.tab-pane');
+      for (var j = 0; j < panes.length; j++) panes[j].classList.remove('active');
+      bankBtn.classList.add('active');
+      bankPane.classList.add('active');
+    }
+  } catch(e) { console.log('hideUploadTab', e); }
+})();
+
 loadPending();
 initVariantsTab();
+// VIEW_FIX_PATCH
+(function(){
+  // 1. hide Upload tab
+  try {
+    var btn = document.querySelector('[data-tab="upload"]');
+    if (btn) btn.style.display = 'none';
+    var pane = document.getElementById('pane-upload');
+    if (pane) pane.style.display = 'none';
+    var bankBtn = document.querySelector('[data-tab="bank"]');
+    var bankPane = document.getElementById('pane-bank');
+    if (bankBtn && bankPane) {
+      var tabs = document.querySelectorAll('.tab');
+      for (var i=0;i<tabs.length;i++) tabs[i].classList.remove('active');
+      var panes = document.querySelectorAll('.tab-pane');
+      for (var j=0;j<panes.length;j++) panes[j].classList.remove('active');
+      bankBtn.classList.add('active');
+      bankPane.classList.add('active');
+    }
+  } catch(e){ console.log('hide tab', e); }
+
+  // 2. renderStudentView - renders task the way student sees it
+  window._renderStudentView = function(t, d){
+    var h = '';
+    if (d.instruction) h += '<div style="font-style:italic;color:#555;margin-bottom:12px;line-height:1.5;font-size:13px">' + esc(d.instruction) + '</div>';
+    if (t === '1'){
+      (d.statements||[]).forEach(function(s){h += '<div style="margin:4px 0;color:#333"><b>' + s.number + '.</b> ' + esc(s.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">Говорящий</th>';
+      'ABCDEF'.split('').forEach(function(k){h += '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';});
+      h += '</tr><tr><td style="border:1px solid #000;padding:6px 14px;color:#000">Ответ</td>';
+      'ABCDEF'.split('').forEach(function(){h += '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';});
+      h += '</tr></table>';
+    } else if (t === '2'){
+      (d.statements||[]).forEach(function(s){h += '<div style="margin:4px 0;color:#333"><b>' + esc(s.letter) + '.</b> ' + esc(s.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">Утв.</th>';
+      'ABCDEFG'.split('').forEach(function(k){h += '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';});
+      h += '</tr><tr><td style="border:1px solid #000;padding:6px 14px;color:#000">Ответ</td>';
+      'ABCDEFG'.split('').forEach(function(){h += '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';});
+      h += '</tr></table>';
+      h += '<div style="font-size:11px;color:#666">1 – True, 2 – False, 3 – Not stated</div>';
+    } else if (t === '3-9'){
+      (d.questions||[]).forEach(function(q){
+        h += '<div style="margin:10px 0;color:#333"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+        ['1','2','3'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(q.options[k]) + '</div>';});
+      });
+    } else if (t === '10'){
+      (d.headings||[]).forEach(function(x){h += '<div style="margin:2px 0;color:#333"><b>' + x.number + '.</b> ' + esc(x.text) + '</div>';});
+      h += '<hr style="margin:12px 0;border:none;border-top:1px solid #999">';
+      (d.texts||[]).forEach(function(x){h += '<div style="margin:10px 0;color:#333;line-height:1.5"><b>' + esc(x.letter) + '.</b> ' + esc(x.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr>' + 'ABCDEFG'.split('').map(function(k){return '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';}).join('') + '</tr>';
+      h += '<tr>' + 'ABCDEFG'.split('').map(function(){return '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';}).join('') + '</tr></table>';
+    } else if (t === '11'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;margin-bottom:12px;color:#333">' + esc(d.text) + '</div>';
+      (d.fragments||[]).forEach(function(f){h += '<div style="margin:2px 0;color:#333"><b>' + f.number + '.</b> ' + esc(f.text) + '</div>';});
+      h += '<table style="border-collapse:collapse;margin:12px 0">';
+      h += '<tr>' + 'ABCDEF'.split('').map(function(k){return '<th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000">' + k + '</th>';}).join('') + '</tr>';
+      h += '<tr>' + 'ABCDEF'.split('').map(function(){return '<td style="border:1px solid #000;padding:6px 14px;min-width:36px">&nbsp;</td>';}).join('') + '</tr></table>';
+    } else if (t === '12-18'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;margin-bottom:12px;color:#333">' + esc(d.text) + '</div>';
+      (d.questions||[]).forEach(function(q){
+        h += '<div style="margin:10px 0;color:#333"><b>' + q.number + '.</b> ' + esc(q.question) + '</div>';
+        ['1','2','3','4'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(q.options[k]) + '</div>';});
+      });
+    } else if (t === '19-24' || t === '25-29'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.8;color:#333">' + esc(d.text) + '</div>';
+      h += '<hr style="margin:12px 0;border:none;border-top:1px solid #999">';
+      (d.items||[]).forEach(function(it){
+        h += '<div style="margin:6px 0;color:#333"><b>' + it.number + '.</b> <span style="font-family:monospace;letter-spacing:1px">' + esc(it.source_word) + '</span> -&gt; _________________</div>';
+      });
+    } else if (t === '30-36'){
+      if (d.title) h += '<div style="font-weight:700;margin-bottom:6px;color:#000">' + esc(d.title) + '</div>';
+      if (d.text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333">' + esc(d.text) + '</div>';
+      (d.items||[]).forEach(function(it){
+        h += '<div style="margin:10px 0;color:#333"><b>' + it.number + '.</b></div>';
+        ['1','2','3','4'].forEach(function(k){h += '<div style="margin:2px 0 2px 20px;color:#444">' + k + ') ' + esc(it.options[k]) + '</div>';});
+      });
+    } else if (t === '37'){
+      if (d.task_text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333;margin-bottom:12px">' + esc(d.task_text) + '</div>';
+      h += '<div style="background:#f5f5f5;border:1px dashed #999;padding:14px;border-radius:6px;color:#666;font-style:italic;text-align:center;font-size:13px">Здесь у ученика будет окно для ввода ответа (90-154 слова) и кнопка «Отправить на проверку»</div>';
+    } else if (t === '38.1' || t === '38.2'){
+      if (d.task_text) h += '<div style="white-space:pre-wrap;line-height:1.6;color:#333;margin-bottom:12px">' + esc(d.task_text) + '</div>';
+      if (d.survey_data && d.survey_data.options){
+        if (d.survey_data.question) h += '<div style="text-align:center;font-weight:700;margin:12px 0 8px;color:#000">' + esc(d.survey_data.question) + '</div>';
+        h += '<table style="border-collapse:collapse;margin:8px 0;width:100%">';
+        h += '<tr><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000;text-align:left">Options</th><th style="border:1px solid #000;padding:6px 14px;background:#eee;color:#000;width:100px;text-align:center">Number of respondents (%)</th></tr>';
+        (d.survey_data.options||[]).forEach(function(o){h += '<tr><td style="border:1px solid #000;padding:6px 14px;color:#333">' + esc(o.option) + '</td><td style="border:1px solid #000;padding:6px 14px;color:#333;text-align:center">' + esc(o.percent) + '</td></tr>';});
+        h += '</table>';
+      }
+      if (d.plan && d.plan.length){
+        h += '<div style="font-weight:700;margin:12px 0 6px;color:#000">Use the following plan:</div>';
+        d.plan.forEach(function(p){h += '<div style="margin:2px 0 2px 20px;color:#333">- ' + esc(p) + '</div>';});
+      }
+      h += '<div style="background:#f5f5f5;border:1px dashed #999;padding:14px;border-radius:6px;color:#666;font-style:italic;text-align:center;font-size:13px;margin-top:12px">Здесь у ученика будет окно для ввода ответа (200-250 слов) и кнопка «Отправить на проверку»</div>';
+    }
+    if (d.answer_key && Object.keys(d.answer_key).length){
+      h += '<div style="margin-top:16px;padding:10px 14px;background:#fff8d8;border:1px solid #b8860b;border-radius:6px;color:#000"><b>Ключ (только для админа):</b><br>';
+      var parts = [];
+      Object.keys(d.answer_key).forEach(function(k){parts.push(k + '-' + d.answer_key[k]);});
+      h += '<span style="font-family:monospace;color:#8b6508;font-weight:700;font-size:13px">' + parts.join('  ') + '</span></div>';
+    }
+    if (d.explanations && Object.keys(d.explanations).length){
+      h += '<details style="margin-top:12px;background:#eef7ee;border:1px solid #4a8f4a;border-radius:6px;padding:10px;color:#000"><summary style="cursor:pointer;color:#2e6b2e;font-weight:700">Объяснения</summary><div style="margin-top:8px">';
+      Object.keys(d.explanations).forEach(function(k){
+        h += '<div style="margin:4px 0;font-size:13px"><b style="color:#2e6b2e">' + esc(k) + ':</b> ' + esc(d.explanations[k]) + '</div>';
+      });
+      h += '</div></details>';
+    }
+    return h;
+  };
+
+  // 3. Import preview: student-style
+  window.renderImportPreview = function(td, t, topic){
+    var res = document.getElementById('impRes');
+    if (!res) return;
+    var h = '';
+    h += '<div class="panel" style="background:rgba(123,92,255,.08);border:1px solid rgba(123,92,255,.4);margin-top:14px">';
+    h += '<h3 style="color:#c9b8ff;margin-bottom:10px">Предпросмотр: задание ' + esc(t) + ' (' + esc(topic) + ')</h3>';
+    h += '<div style="background:#fff;color:#000;padding:20px;border-radius:8px;max-height:600px;overflow:auto;font-family:Times New Roman,serif;font-size:12pt;line-height:1.4">';
+    h += window._renderStudentView(t, td);
+    h += '</div>';
+    h += '<div style="display:flex;gap:12px;margin-top:16px">';
+    h += '<button class="btn btn-ok" style="width:auto;padding:12px 24px" onclick="importConfirmSave()">Сохранить в банк</button>';
+    h += '<button class="btn btn-cancel" style="width:auto;padding:12px 24px" onclick="importCancelPreview()">Отменить</button>';
+    h += '</div>';
+    h += '<details style="margin-top:10px"><summary style="cursor:pointer;color:#8b93c4;font-size:12px">Показать JSON</summary><pre style="color:#a0a8d0;font-size:11px;background:rgba(5,6,15,.5);padding:10px;border-radius:6px;max-height:200px;overflow:auto;margin-top:8px">' + esc(JSON.stringify(td, null, 2)) + '</pre></details>';
+    h += '</div>';
+    res.className = '';
+    res.innerHTML = h;
+  };
+
+  // 4. Bank viewer: full task
+  window.openTask = async function(task_type, topic_letter, code){
+    var v = document.getElementById('bankList');
+    v.innerHTML = '<div class="res">Загружаю ' + esc(code) + '...</div>';
+    try {
+      var d = await api({action:'get_bank_task', task_type:task_type, topic_letter:topic_letter, code:code});
+      if (d.error){ v.innerHTML = '<div class="res err">Ошибка: ' + esc(d.error) + '</div>'; return; }
+      _loadedBankTask = d;
+      _loadedBankTask.task_type = task_type;
+      var h = '<div class="res ok" style="margin-top:12px">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><b style="font-family:monospace;font-size:16px">' + esc(d.code) + '</b><button class="btn btn-sm btn-outline" onclick="listBank()">Закрыть</button></div>';
+      if (d.audio_b64){
+        var bytes = b64ToBytes(d.audio_b64);
+        var url = URL.createObjectURL(new Blob([bytes], {type:'audio/mpeg'}));
+        h += '<audio controls src="' + url + '" style="width:100%;margin:8px 0"></audio>';
+      }
+      h += '<div style="background:#fff;color:#000;padding:20px;border-radius:8px;max-height:600px;overflow:auto;font-family:Times New Roman,serif;font-size:12pt;line-height:1.4;margin-top:12px">';
+      h += window._renderStudentView(task_type, d);
+      h += '</div>';
+      h += '<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(123,92,255,.2)"><b style="color:#c9b8ff">Скачать PDF:</b><br>';
+      h += '<button class="btn btn-sm btn-outline" style="margin-right:8px;margin-top:8px" onclick="downloadLoadedBankTask(false)">Для ученика</button>';
+      h += '<button class="btn btn-sm" style="margin-top:8px" onclick="downloadLoadedBankTask(true)">Для учителя</button></div>';
+      h += '</div>';
+      v.innerHTML = h;
+    } catch(e){ v.innerHTML = '<div class="res err">Ошибка: ' + esc(e.message) + '</div>'; }
+  };
+
+  // 5. PDF via html2pdf
+  window._loadHtml2PdfOnce = function(cb){
+    if (typeof html2pdf !== 'undefined') { cb(true); return; }
+    var urls = [
+      'https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js',
+      'https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.1/dist/html2pdf.bundle.min.js'
+    ];
+    var i = 0;
+    (function next(){
+      if (i >= urls.length) { cb(false); return; }
+      var s = document.createElement('script');
+      s.src = urls[i++];
+      s.onload = function(){ cb(typeof html2pdf !== 'undefined'); };
+      s.onerror = next;
+      document.head.appendChild(s);
+    })();
+  };
+
+  window.openPrintWindow = function(bodyHtml, title){
+    window._loadHtml2PdfOnce(function(ok){
+      if (!ok) {
+        var w = window.open('', '_blank');
+        if (w) {
+          var doc = '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + esc(title) + '</title><style>' + (typeof PRINT_CSS !== 'undefined' ? PRINT_CSS : '') + '</style></head><body class="print-body"><div class="print-doc">' + bodyHtml + '</div><scr' + 'ipt>window.addEventListener("load",function(){setTimeout(function(){window.print();},500);});</scr' + 'ipt></body></html>';
+          w.document.open(); w.document.write(doc); w.document.close();
+        }
+        return;
+      }
+      var c = document.createElement('div');
+      c.className = 'print-doc';
+      c.style.cssText = 'position:fixed;top:0;left:0;width:210mm;background:#fff;color:#000;z-index:99999;padding:20px;opacity:0;pointer-events:none;font-family:"Times New Roman",Times,serif;font-size:12pt;line-height:1.4';
+      c.innerHTML = bodyHtml;
+      document.body.appendChild(c);
+      var safe = (title || 'document').replace(/[^A-Za-zА-Яа-я0-9_ -]+/g, '_').trim() || 'document';
+      setTimeout(function(){
+        var opt = {
+          margin: [10,10,10,10],
+          filename: safe + '.pdf',
+          image: { type:'jpeg', quality:0.95 },
+          html2canvas: { scale:2, useCORS:true, logging:false, backgroundColor:'#ffffff', scrollX:0, scrollY:0, windowWidth:794 },
+          jsPDF: { unit:'mm', format:'a4', orientation:'portrait' },
+          pagebreak: { mode:['css','legacy'] }
+        };
+        html2pdf().set(opt).from(c).output('datauristring').then(function(dataUri){
+          if (c.parentNode) c.parentNode.removeChild(c);
+          var a = document.createElement('a');
+          a.href = dataUri;
+          a.download = safe + '.pdf';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function(){ document.body.removeChild(a); }, 500);
+        }).catch(function(err){
+          if (c.parentNode) c.parentNode.removeChild(c);
+          console.error('pdf err', err);
+          alert('PDF: ' + (err && err.message ? err.message : err));
+        });
+      }, 400);
+    });
+  };
+})();
+
+// SERVER_PDF_OVERRIDE
+(function(){
+  window._serverPdf = async function(taskType, taskData, withAnswers, filename){
+    try {
+      var res = await fetch(window.location.pathname, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action:'pdf_download', task_type: taskType, task_data: taskData, with_answers: !!withAnswers})
+      });
+      var d = await res.json();
+      if (d.error) { alert('Ошибка: ' + d.error); return; }
+      if (!d.pdf) { alert('Пустой PDF'); return; }
+      var bin = atob(d.pdf);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      var blob = new Blob([bytes], {type:'application/pdf'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = (filename || ('task_' + taskType)) + '.pdf';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1500);
+    } catch(e) {
+      alert('Ошибка: ' + e.message);
+    }
+  };
+
+  window.downloadLoadedBankTask = function(withAnswers){
+    if (!_loadedBankTask) { alert('Ничего не загружено'); return; }
+    var t = _loadedBankTask.task_type;
+    var name = 'Задание_' + t + (_loadedBankTask.code ? ('_' + _loadedBankTask.code) : '') + (withAnswers ? '_с_ответами' : '');
+    window._serverPdf(t, _loadedBankTask, withAnswers, name);
+  };
+
+  window.downloadTaskPDF = function(){
+    var d = window._taskData;
+    if (!d) { alert('Задание не загружено'); return; }
+    var t = (d._meta && d._meta.task_type) || d.task_type || '';
+    window._serverPdf(t, d, false, 'Задание_' + t);
+  };
+})();
+
+// FIX38D
+(function(){
+  function _clean38(d){
+    if (!d || !d.task_text) return d;
+    var tt = String(d.task_text);
+    if (tt.toLowerCase().indexOf('imagine') < 0) return d;
+    var lines = tt.split(/\n+/);
+    var keep = [];
+    for (var i = 0; i < lines.length; i++){
+      var s = lines[i].trim();
+      if (!s) continue;
+      var l = s.toLowerCase();
+      if (l.indexOf('imagine that') === 0 || l.indexOf('comment on') === 0 || l.indexOf('[38.1]') === 0 || l.indexOf('[38.2]') === 0) {
+        keep.push(s);
+      }
+    }
+    if (!keep.length) return d;
+    var d2 = {};
+    for (var k in d) if (Object.prototype.hasOwnProperty.call(d, k)) d2[k] = d[k];
+    d2.task_text = keep.join(' ');
+    return d2;
+  }
+
+  function _wrap38(){
+    var orig = window.renderTaskForPrint;
+    if (typeof orig !== 'function' || orig.__is38d) return;
+    var wrapped = function(t, d, opts){
+      if (t === '38.1' || t === '38.2') d = _clean38(d);
+      return orig.call(this, t, d, opts);
+    };
+    wrapped.__is38d = true;
+    window.renderTaskForPrint = wrapped;
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wrap38);
+  } else {
+    _wrap38();
+  }
+  setTimeout(_wrap38, 500);
+  setTimeout(_wrap38, 1500);
+})();
+
 </script>
 </body>
 </html>"""
