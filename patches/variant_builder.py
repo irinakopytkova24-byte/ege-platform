@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Patch: student variant builder button + bank-first generation.
-# ASCII only. No Cyrillic, no emoji. Works in any encoding.
+# Patch: student variant builder + bank-first generation.
+# ASCII only. No Cyrillic, no emoji.
 
 PATCH_NAME = "variant_builder"
 PATCH_DESCRIPTION = "Student variant builder button + bank-first generation"
@@ -189,49 +189,38 @@ async function buildStudentVariant() {
 }
 '''
 
-CARD_OLD = '''    <div class="card" id="myVariantsCard" style="display:none">
-      <h3>My Variants</h3>
-      <div id="myVariants"><div class="mat-empty">Loading...</div></div>
-    </div>'''
+CARD_OLD = '<div id="myVariants"><div class="mat-empty">'
 
-CARD_NEW = '''    <div class="card" id="myVariantsCard" style="display:none">
-      <h3>My Variants</h3>
-      <div style="margin-bottom:14px">
-        <button class="btn btn-ok" style="width:auto;padding:12px 24px;font-size:16px" onclick="openBuildVariant()">&#127919; Build full EGE variant</button>
-      </div>
-      <div id="myVariants"><div class="mat-empty">Loading...</div></div>
-    </div>
+CARD_NEW = ('<div style="margin-bottom:14px">'
+            '<button class="btn btn-ok" style="width:auto;padding:12px 24px;font-size:16px" onclick="openBuildVariant()">&#127919; Build full EGE variant</button>'
+            '</div>'
+            '<div id="myVariants"><div class="mat-empty">')
 
-    <div class="modal-bg" id="buildVariantModal" onclick="if(event.target===this)closeBuildVariant()">
-      <div class="modal" style="max-width:600px">
-        <button class="close" onclick="closeBuildVariant()">x</button>
-        <h3>&#127919; Build full EGE variant</h3>
-        <p style="color:#8b93c4;font-size:14px;line-height:1.6;margin-bottom:14px">All tasks (1-36, 37, 38) will be generated. Takes 5-7 minutes, do not close the page.</p>
-        <div class="f">
-          <label>Task 38 - choose one</label>
-          <div style="display:flex;gap:20px;margin-top:6px">
-            <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
-              <input type="radio" name="sb38" value="38.1" checked style="accent-color:#7b5cff;transform:scale(1.3)"> 38.1 (table)
-            </label>
-            <label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">
-              <input type="radio" name="sb38" value="38.2" style="accent-color:#7b5cff;transform:scale(1.3)"> 38.2 (chart)
-            </label>
-          </div>
-        </div>
-        <div class="f">
-          <label>Topic</label>
-          <select id="sbTopic">__TOPIC_OPTIONS__</select>
-        </div>
-        <button class="btn btn-ok" id="sbStartBtn" onclick="buildStudentVariant()">&#128640; Build variant</button>
-        <div id="sbProgress" style="display:none;margin-top:14px;padding:14px;background:rgba(123,92,255,.1);border-radius:10px">
-          <div style="color:#c9b8ff;font-size:14px;font-weight:600;margin-bottom:8px" id="sbProgressText">Preparing...</div>
-          <div style="background:rgba(5,6,15,.5);border-radius:6px;height:8px;overflow:hidden">
-            <div id="sbProgressBar" style="height:100%;background:linear-gradient(90deg,#7b5cff,#00e5ff);width:0%;transition:width .3s"></div>
-          </div>
-        </div>
-        <div id="sbError" class="er" style="display:none;margin-top:12px"></div>
-      </div>
-    </div>'''
+MODAL_HTML = ('<div class="modal-bg" id="buildVariantModal" onclick="if(event.target===this)closeBuildVariant()">'
+              '<div class="modal" style="max-width:600px">'
+              '<button class="close" onclick="closeBuildVariant()">x</button>'
+              '<h3>Build full EGE variant</h3>'
+              '<p style="color:#8b93c4;font-size:14px;line-height:1.6;margin-bottom:14px">'
+              'All tasks (1-36, 37, 38) will be generated. Takes 5-7 minutes.'
+              '</p>'
+              '<div class="f"><label>Task 38 - choose one</label>'
+              '<div style="display:flex;gap:20px;margin-top:6px">'
+              '<label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">'
+              '<input type="radio" name="sb38" value="38.1" checked> 38.1 (table)</label>'
+              '<label style="display:flex;gap:8px;align-items:center;font-size:15px;color:#d0d5f5;cursor:pointer">'
+              '<input type="radio" name="sb38" value="38.2"> 38.2 (chart)</label>'
+              '</div></div>'
+              '<div class="f"><label>Topic</label>'
+              '<select id="sbTopic">__TOPIC_OPTIONS__</select></div>'
+              '<button class="btn btn-ok" id="sbStartBtn" onclick="buildStudentVariant()">Build variant</button>'
+              '<div id="sbProgress" style="display:none;margin-top:14px;padding:14px;background:rgba(123,92,255,.1);border-radius:10px">'
+              '<div style="color:#c9b8ff;font-size:14px;font-weight:600;margin-bottom:8px" id="sbProgressText">Preparing...</div>'
+              '<div style="background:rgba(5,6,15,.5);border-radius:6px;height:8px;overflow:hidden">'
+              '<div id="sbProgressBar" style="height:100%;background:linear-gradient(90deg,#7b5cff,#00e5ff);width:0%;transition:width .3s"></div>'
+              '</div></div>'
+              '<div id="sbError" class="er" style="display:none;margin-top:12px"></div>'
+              '</div></div>\n\n'
+              '<div class="modal-bg" id="resultModal"')
 
 
 def is_applied(src):
@@ -242,27 +231,36 @@ def apply(src):
     if is_applied(src):
         return src
 
+    # 1. Python functions
     if "def generate_variant_prefer_bank" not in src:
         if "def generate_variant(topic_config):" not in src:
-            raise Exception("anchor not found: def generate_variant")
+            raise Exception("anchor: def generate_variant")
         src = src.replace("def generate_variant(topic_config):",
                           PY_NEW_FUNCS + "def generate_variant(topic_config):", 1)
 
+    # 2. Handler
     if "r = generate_variant_prefer_bank(topic_config)" not in src:
         if "r = generate_variant(topic_config)" not in src:
-            raise Exception("anchor not found: r = generate_variant")
+            raise Exception("anchor: r = generate_variant")
         src = src.replace("r = generate_variant(topic_config)",
                           "r = generate_variant_prefer_bank(topic_config)", 1)
 
+    # 3. Button in card
     if "openBuildVariant()" not in src:
-        if CARD_OLD in src:
-            src = src.replace(CARD_OLD, CARD_NEW, 1)
-        else:
-            raise Exception("anchor not found: myVariantsCard")
+        if CARD_OLD not in src:
+            raise Exception("anchor: myVariants card")
+        src = src.replace(CARD_OLD, CARD_NEW, 1)
 
+    # 4. Modal before resultModal
+    if "buildVariantModal" not in src:
+        if '<div class="modal-bg" id="resultModal"' not in src:
+            raise Exception("anchor: resultModal")
+        src = src.replace('<div class="modal-bg" id="resultModal"', MODAL_HTML, 1)
+
+    # 5. JS functions
     if "function openBuildVariant" not in src:
         if "async function loadMyVariants()" not in src:
-            raise Exception("anchor not found: loadMyVariants")
+            raise Exception("anchor: loadMyVariants")
         src = src.replace("async function loadMyVariants()",
                           JS_FUNCS + "async function loadMyVariants()", 1)
 
